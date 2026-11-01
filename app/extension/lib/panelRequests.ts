@@ -131,7 +131,9 @@ async function report(ctx: PanelContext, b: Binding, req: Extract<PanelRequest, 
         json: true,
         body: { projectId: b.projectId, title, description, priority, tags: ['extension'] } as unknown as BodyInit,
     });
-    if (res.status === 403) throw new ConnectProblem('no-access', 'Your role in this project cannot create tickets.');
+    // The server answers 400 "Project not found" when the caller is not a member
+    // (it never answers 403 here), so that is what "no access" looks like.
+    if (res.status === 400) throw new ConnectProblem('no-access', `You can no longer file tickets in “${b.name}”.`);
     if (!res.ok) throw new ConnectProblem('server', `The server answered ${res.status}.`);
     const ticket = (await res.json().catch(() => null)) as { id?: unknown } | null;
     if (!ticket || (typeof ticket.id !== 'string' && typeof ticket.id !== 'number')) throw new ConnectProblem('server', 'The server sent an unexpected ticket response.');
