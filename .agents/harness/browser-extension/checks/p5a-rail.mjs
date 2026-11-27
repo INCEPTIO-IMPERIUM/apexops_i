@@ -140,6 +140,73 @@ const logoAt = async (p) => {
     const r = await railPoint(p);
     return r ? { x: Math.round((r.left + r.right) / 2), y: Math.round(r.top + 16) } : null;
 };
+/**
+ * Runs `source` (an async function body) in the toolbar content script's own
+ * ISOLATED world — the T1 trust zone H2 closes storage to — and returns its value.
+ */
+const inToolbarWorld = async (p, source) => {
+    const cdp = await p.createCDPSession();
+    const ids = [];
+    cdp.on('Runtime.executionContextCreated', ({ context }) => {
+        if (context.auxData?.type === 'isolated' && context.name === 'ApexOps' && context.auxData?.isDefault === false) ids.push(context.id);
+    });
+    await cdp.send('Runtime.enable');
+    await sleep(200);
+    if (!ids.length) return { error: 'no ApexOps isolated world' };
+    const r = await cdp.send('Runtime.evaluate', { contextId: ids[ids.length - 1], expression: `(async () => { ${source} })()`, awaitPromise: true, returnByValue: true });
+    await cdp.detach();
+    return r.exceptionDetails ? { error: r.exceptionDetails.exception?.description ?? r.exceptionDetails.text } : r.result.value;
+};
+
+/**
+ * `message` listeners on the page's window, the page's own plus the ApexOps
+ * world's: CDP lists a window's listeners per world, so both are asked.
+ */
+const messageListeners = async (p) => {
+    const cdp = await p.createCDPSession();
+    const contexts = [];
+    cdp.on('Runtime.executionContextCreated', ({ context }) => {
+        if (context.auxData?.frameId && (context.auxData.isDefault || (context.auxData.type === 'isolated' && context.name === 'ApexOps'))) contexts.push(context);
+    });
+    await cdp.send('Runtime.enable');
+    await sleep(200);
+    const top = (await cdp.send('Page.getFrameTree')).frameTree.frame.id;
+    let n = 0;
+    for (const c of contexts.filter((c) => c.auxData.frameId === top)) {
+        const { result } = await cdp.send('Runtime.evaluate', { expression: 'window', contextId: c.id });
+        const { listeners } = await cdp.send('DOMDebugger.getEventListeners', { objectId: result.objectId });
+        n += listeners.filter((l) => l.type === 'message').length;
+    }
+    await cdp.detach();
+    return n;
+};
+
+/**
+ * H4: Switch and Report are refused until the browser has reported the panel
+ * visible for 500 ms. A person takes longer than that to reach either button;
+ * the harness does not, so it waits as a person would.
+ */
+const panelSettled = (p) =>
+    until(
+        () =>
+            panelFrame(p).evaluate(() => {
+                const [v, at] = (document.documentElement.dataset.visible ?? '').split('@');
+                return v === 'true' && performance.now() - Number(at) > 700;
+            }),
+        5000,
+        100
+    );
+
+/** H4: what a clickjacking page does: lay a faint full-page layer over everything, letting clicks through. */
+const addOverlay = (p) =>
+    p.evaluate(() => {
+        const o = document.createElement('div');
+        o.id = 'jack';
+        o.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:rgba(255,0,0,0.05)';
+        document.documentElement.append(o); // after the toolbar host, so it paints above it
+    });
+const removeOverlay = (p) => p.evaluate(() => document.getElementById('jack')?.remove());
+
 const panelFrame = (p) => p.frames().find((f) => /\/panel\.html/.test(f.url()));
 /**
  * Open = the page sees far more of the toolbar host than a rail's worth.
@@ -257,12 +324,46 @@ try {
     });
     check('the rail\'s shadow root is closed and the page\'s patched attachShadow did not capture it', hostInfo.shadowRoot && hostInfo.captured === 0, JSON.stringify(hostInfo));
 
+    // ── C2. H2: nothing in storage is readable from the toolbar's world ──
+    const read = await inToolbarWorld(site, `
+        try { const v = await chrome.storage.local.get(null); return { got: Object.keys(v) }; }
+        catch (e) { return { rejected: String(e.message ?? e) }; }`);
+    check("H2: storage.local.get from the toolbar's world is refused", !!read?.rejected, JSON.stringify(read).slice(0, 120));
+    // Listen in that world, then change a stored secret the way a token rotation does.
+    await inToolbarWorld(site, `
+        window.__h2 = { changed: 0, messages: 0 };
+        chrome.storage.onChanged.addListener(() => window.__h2.changed++);
+        chrome.runtime.onMessage.addListener(() => { window.__h2.messages++; });
+        return true;`);
+    await sw.evaluate((v) => chrome.storage.local.set({ h2probe: v }), `secret-${RUN}`);
+    await sleep(1500);
+    const quiet = await inToolbarWorld(site, 'return window.__h2;');
+    // Control, same listeners: a toolbar change for this site does arrive.
+    await sw.evaluate((o) => chrome.storage.local.get('toolbarPrefs').then((v) => chrome.storage.local.set({ toolbarPrefs: { ...(v.toolbarPrefs ?? {}), [o]: { right: 16, bottom: 16 } } })), SITE);
+    const told = await until(async () => ((await inToolbarWorld(site, 'return window.__h2;'))?.messages ?? 0) > 0 && (await inToolbarWorld(site, 'return window.__h2;')), 5000);
+    await sw.evaluate(() => chrome.storage.local.remove('h2probe'));
+    check(
+        "H2: a secret written to storage reaches the toolbar's world zero times (control: a toolbar change does)",
+        quiet?.changed === 0 && quiet?.messages === 0 && !!told && told.messages >= 1,
+        `secret write -> ${JSON.stringify(quiet)}; toolbar change -> ${JSON.stringify(told)}`
+    );
+
+    // ── C3. H4: a toolbar that was never opened adds no message listener to the page ──
+    const baseline = await messageListeners(unbound);
+    const closedCount = await messageListeners(site);
+
     // ── D. clicking the rail is not a click on the page ──
     const before = await site.evaluate(() => ({ doc: window.docClicks, page: window.pageClicks }));
     check('rail covers the page button in the corner before it is moved', (await site.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.tagName, await logoAt(site))) === 'APEXOPS-TOOLBAR');
     const opened = await openPanel(site);
     const after = await site.evaluate(() => ({ doc: window.docClicks, page: window.pageClicks }));
     check('clicking the ApexOps button opens the panel', !!opened);
+    const openCount = await messageListeners(site);
+    check(
+        'H4: closed and never opened, the toolbar adds no message listener (control: opening adds one)',
+        closedCount === baseline && openCount === baseline + 1,
+        `unbound page ${baseline}, bound closed ${closedCount}, after opening ${openCount}`
+    );
     check('...and the page\'s own click handlers never saw that click', after.doc === before.doc && after.page === before.page, JSON.stringify({ before, after }));
 
     // ── E. the panel: project, count, and nothing of it readable from the page ──
@@ -292,6 +393,7 @@ try {
     await f.type('#bug-title', `Button misaligned ${RUN}`);
     await f.type('#bug-description', 'The pay button overlaps the total.');
     await f.select('#bug-priority', 'high');
+    await panelSettled(site);
     await panelClick(site, 'Create ticket');
     t = (await waitPanelText(site, /Ticket TICK-\d+ created/, 10_000)) || (await panelText(site));
     const ticketId = (t.match(/Ticket (TICK-\d+) created/) ?? [])[1];
@@ -337,6 +439,12 @@ try {
     check('a forged "hide" posted by the page is ignored', !!(await railPoint(site)) && !(await stored('toolbarPrefs')).toolbarPrefs?.[SITE]?.hidden);
 
     // ── I. drag it out of the way; the page button works; the place is remembered ──
+    // A second tab of the same site follows live (H2: pushed by the worker, not read from storage).
+    const site2 = await browser.newPage();
+    await site2.setViewport({ width: 1280, height: 800 });
+    await site2.goto(`${SITE}/`, { waitUntil: 'load' });
+    await until(() => railPoint(site2), 5000);
+    await site.bringToFront();
     const at = await logoAt(site);
     await site.mouse.move(at.x, at.y);
     await site.mouse.down();
@@ -345,6 +453,13 @@ try {
     await sleep(500);
     const r1 = await railPoint(site);
     check('dragged: the rail moved and the panel did not open', !!r1 && r1.right < r0.right - 500 && !(await panelOpen(site)), r1 ? `now at ${r1.left},${r1.top}` : 'gone');
+    const gap = (r) => r && { x: r.vw - r.right, y: r.vh - r.bottom };
+    const followed = await until(async () => {
+        const a = gap(await railPoint(site));
+        const b = gap(await railPoint(site2));
+        return a && b && Math.abs(a.x - b.x) <= 6 && Math.abs(a.y - b.y) <= 6 && b;
+    }, 5000);
+    check('H2: a second tab of the same site moves its rail too, without a reload', !!followed, followed ? `second tab gap ${followed.x},${followed.y}` : JSON.stringify(gap(await railPoint(site2))));
     const clicksBefore = await site.evaluate(() => window.pageClicks);
     await site.click('#corner');
     check('the site\'s own button in that corner is clickable now', (await site.evaluate(() => window.pageClicks)) === clicksBefore + 1);
@@ -391,6 +506,7 @@ try {
     await panelClick(site, 'Switch project');
     await until(() => panelFrame(site).$('#switch-project'), 8000);
     await panelFrame(site).select('#switch-project', other.slug);
+    await panelSettled(site);
     await panelClick(site, 'Switch');
     t = (await waitPanelText(site, /now sends to/, 10_000)) || (await panelText(site));
     const tagK = `${RUN}-after-switch`;
@@ -403,8 +519,34 @@ try {
     await panelClick(site, 'Switch project');
     await until(() => panelFrame(site).$('#switch-project'), 8000);
     await panelFrame(site).select('#switch-project', SLUG);
+    await panelSettled(site);
     await panelClick(site, 'Switch');
     await waitPanelText(site, /now sends to/, 10_000);
+
+    // ── K2. H4: with the page laying something over the panel, Switch and Report are refused ──
+    await addOverlay(site);
+    await sleep(700); // longer than the observer's 100 ms delay
+    await panelClick(site, 'Switch project');
+    await until(() => panelFrame(site).$('#switch-project'), 8000);
+    await panelFrame(site).select('#switch-project', other.slug);
+    const slugBefore = (await stored('bindings')).bindings?.[SITE]?.slug;
+    await panelClick(site, 'Switch');
+    const refusedSwitch = await waitPanelText(site, /covering this panel/, 3000);
+    await sleep(500);
+    check(
+        'H4: covered panel: Switch is refused and the binding is unchanged',
+        !!refusedSwitch && (await stored('bindings')).bindings?.[SITE]?.slug === slugBefore,
+        `slug ${slugBefore} -> ${(await stored('bindings')).bindings?.[SITE]?.slug}`
+    );
+    await panelClick(site, 'Cancel');
+    await until(() => panelFrame(site).$('#bug-title'), 5000);
+    await panelFrame(site).type('#bug-title', `covered ${RUN}`);
+    await panelClick(site, 'Create ticket');
+    const refusedReport = await waitPanelText(site, /covering this panel/, 3000);
+    const keptTitle = await panelFrame(site).$eval('#bug-title', (e) => e.value).catch(() => null);
+    check('H4: covered panel: Report is refused and what was typed is kept', !!refusedReport && keptTitle === `covered ${RUN}`, `title field: ${keptTitle}`);
+    await removeOverlay(site);
+    await panelFrame(site).$eval('#bug-title', (e) => { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); }).catch(() => undefined);
 
     // ── L. the panel cannot do what only the popup may (R18), and vice versa ──
     const fromPanel = await panelFrame(site).evaluate((o) => chrome.runtime.sendMessage({ type: 'disconnect', siteOrigin: o }).then((r) => r ?? null, (e) => ({ rejected: true })), SITE);
@@ -420,6 +562,7 @@ try {
     await sleep(1200);
     const stillHidden = !(await railPoint(site));
     check('hide: the rail goes, and stays gone after a reload', !!hidden && stillHidden);
+    check('H2: ...and the second tab of the site hides too, live', !!(await until(async () => !(await railPoint(site2)), 3000)));
     const pop = await browser.newPage();
     pop.on('pageerror', (e) => console.log(`popup error: ${e.message}`));
     pop.on('console', (m) => m.type() === 'error' && console.log(`popup console: ${m.text()}`));
@@ -435,6 +578,8 @@ try {
     });
     const back = await until(() => railPoint(site), 5000);
     check('the popup offers "Show toolbar" and the rail comes back live', showBtn && !!back);
+    check('H2: ...in the second tab as well', !!(await until(() => railPoint(site2), 5000)));
+    await site2.close();
     await pop.close();
 
     // ── N. signed out: the panel asks to sign in, naming the host; signing in works ──
@@ -462,7 +607,7 @@ try {
     const ms = Date.now() - t0;
     await panelClick(site, 'Refresh');
     const refreshed = await waitPanelText(site, /Recent issues/i, 10_000);
-    check('a page throwing 70 errors a second: the panel opens and answers', !!t && !!refreshed && ms < 8000, `${ms} ms to show the project`);
+    check('a page throwing 70 errors a second: the panel opens and answers', !!t && !!refreshed && ms < 8000, `${ms} ms to show the project` + (t ? '' : ` / panel: ${(await panelText(site)).replace(/\s+/g, ' ').slice(0, 140)}`));
     await site.goto(`${SITE}/`, { waitUntil: 'load' });
 
     // ── P. disconnect from the popup: the rail leaves the open page ──

@@ -5,6 +5,7 @@ import { ConnectProblem, connectSite } from './connect';
 import { readIngestProblems } from './ingestProblems';
 import type { PanelIssue, PanelProject, PanelRequest, PanelState, Reply, ReportResult } from './messages';
 import { fail, toReply } from './requests';
+import { TICKET_PRIORITIES } from '@apexops/shared/types/tickets';
 import { stripUrl } from './sanitize';
 import { ensureSession, login, storedApiUrl, whoami } from './session';
 import { eventsFromTab } from './tabCounts';
@@ -39,7 +40,7 @@ const siteOf = (ctx: PanelContext): string | null => {
 
 const appLink = (b: Binding, path: string): string | null => (b.appOrigin ? `${b.appOrigin}/p/${encodeURIComponent(b.slug)}${path}` : null);
 
-const LEVELS = new Set(['low', 'medium', 'high', 'critical']);
+const LEVELS: ReadonlySet<string> = new Set(TICKET_PRIORITIES);
 const MAX_TITLE = 200;
 const MAX_DESCRIPTION = 20_000;
 
@@ -67,7 +68,7 @@ async function call(b: Binding, path: string, init: Parameters<typeof fetchWithA
 }
 
 async function state(ctx: PanelContext, site: string, b: Binding): Promise<PanelState> {
-    const [session, problems, events, current] = await Promise.all([whoami(), readIngestProblems(), eventsFromTab(ctx.tabId), storedApiUrl()]);
+    const [session, problems, events, current] = await Promise.all([whoami(), readIngestProblems(), eventsFromTab(ctx.tabId, site), storedApiUrl()]);
     return {
         bound: true,
         site,
@@ -131,7 +132,9 @@ async function report(ctx: PanelContext, b: Binding, req: Extract<PanelRequest, 
         json: true,
         body: { projectId: b.projectId, title, description, priority, tags: ['extension'] } as unknown as BodyInit,
     });
-    if (res.status === 403) throw new ConnectProblem('no-access', 'Your role in this project cannot create tickets.');
+    // The server answers 400 "Project not found" when the caller is not a member
+    // (it never answers 403 here), so that is what "no access" looks like.
+    if (res.status === 400) throw new ConnectProblem('no-access', `You can no longer file tickets in “${b.name}”.`);
     if (!res.ok) throw new ConnectProblem('server', `The server answered ${res.status}.`);
     const ticket = (await res.json().catch(() => null)) as { id?: unknown } | null;
     if (!ticket || (typeof ticket.id !== 'string' && typeof ticket.id !== 'number')) throw new ConnectProblem('server', 'The server sent an unexpected ticket response.');

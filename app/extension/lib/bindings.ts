@@ -33,6 +33,29 @@ export async function readBindings(): Promise<Bindings> {
     return value && typeof value === 'object' ? (value as Bindings) : {};
 }
 
+/**
+ * The worker's hot path (every captured batch, every delivery) reads bindings
+ * from memory, not storage (hardening H3). Dropped on every write made here and
+ * on the worker's `storage.onChanged` for this key, which covers writes from
+ * the popup's own context.
+ */
+let cached: Promise<Bindings> | null = null;
+
+export function readBindingsCached(): Promise<Bindings> {
+    if (!cached) {
+        const read = readBindings();
+        cached = read;
+        read.catch(() => {
+            if (cached === read) cached = null;
+        });
+    }
+    return cached;
+}
+
+export function invalidateBindingsCache(): void {
+    cached = null;
+}
+
 // Read-modify-write on one key. Two writers (a connect and a key refresh) that
 // each read the old map would silently drop each other's change, so every
 // update goes through this chain.
@@ -42,6 +65,7 @@ export function updateBindings(change: (current: Bindings) => Bindings): Promise
     const run = chain.then(async () => {
         const next = change(await readBindings());
         await browser.storage.local.set({ [BINDINGS_KEY]: next });
+        invalidateBindingsCache();
         return next;
     });
     chain = run.catch(() => undefined);

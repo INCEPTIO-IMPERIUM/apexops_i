@@ -1,4 +1,4 @@
-import type { IngestEvent } from './sanitize';
+import { MAX_BODY_CHARS, MAX_EVENTS_PER_BATCH, type IngestEvent } from './sanitize';
 
 /**
  * Events waiting to reach /api/ingest, persisted so a stopped service worker
@@ -38,6 +38,50 @@ export type SendResult = 'sent' | 'retry' | 'drop';
 /** Bound on what a flood on one page — or a long outage — can pile up in storage. */
 export const MAX_QUEUED_EVENTS = 1000;
 
+const eventsOf = (items: QueueItem[], origin?: string) =>
+    items.reduce((n, i) => (origin === undefined || i.origin === origin ? n + i.events.length : n), 0);
+
+/**
+ * Which batch to drop when the queue is full (hardening H3, D3).
+ *
+ * Oldest first — during a flood the newest batches describe the live failure —
+ * but one noisy site may not push out another site's events: while some origin
+ * holds more than half the queue and another origin has events waiting, the
+ * noisy origin loses its own oldest batch.
+ */
+function evictionIndex(items: QueueItem[]): number {
+    const byOrigin = new Map<string, number>();
+    for (const i of items) byOrigin.set(i.origin, (byOrigin.get(i.origin) ?? 0) + i.events.length);
+    if (byOrigin.size > 1) {
+        for (const [origin, n] of byOrigin) {
+            if (n > MAX_QUEUED_EVENTS / 2) return items.findIndex((i) => i.origin === origin);
+        }
+    }
+    return 0;
+}
+
+/**
+ * The head batch plus every later batch from the same site that fits in one
+ * request: one POST for many page batches instead of one each. Within the
+ * server's per-request event cap and the size one page batch may have.
+ */
+function nextGroup(items: QueueItem[]): QueueItem[] {
+    const head = items[0];
+    if (!head) return [];
+    const group = [head];
+    let events = head.events.length;
+    let chars = JSON.stringify(head.events).length;
+    for (const item of items.slice(1)) {
+        if (item.origin !== head.origin) continue;
+        const size = JSON.stringify(item.events).length;
+        if (events + item.events.length > MAX_EVENTS_PER_BATCH || chars + size > MAX_BODY_CHARS) break;
+        group.push(item);
+        events += item.events.length;
+        chars += size;
+    }
+    return group;
+}
+
 export function createIngestQueue(
     store: QueueStore,
     send: (item: QueueItem) => Promise<SendResult>,
@@ -58,10 +102,8 @@ export function createIngestQueue(
         await locked(async () => {
             const items = await store.load();
             items.push({ id: newId(), origin, events, attempts: 0 });
-            // Oldest out first: during a flood the newest batches describe the
-            // live failure.
-            let total = items.reduce((n, i) => n + i.events.length, 0);
-            while (total > MAX_QUEUED_EVENTS && items.length > 1) total -= items.shift()!.events.length;
+            let total = eventsOf(items);
+            while (total > MAX_QUEUED_EVENTS && items.length > 1) total -= items.splice(evictionIndex(items), 1)[0]!.events.length;
             await store.save(items);
         });
     }
@@ -74,24 +116,26 @@ export function createIngestQueue(
         flushing = (async () => {
             try {
                 for (;;) {
-                    const next = await locked(async () => (await store.load())[0]);
-                    if (!next) return;
+                    const group = await locked(async () => nextGroup(await store.load()));
+                    const head = group[0];
+                    if (!head) return;
+                    const ids = new Set(group.map((g) => g.id));
 
                     let result: SendResult;
                     try {
-                        result = await send(next);
+                        result = await send({ ...head, events: group.flatMap((g) => g.events) });
                     } catch {
                         result = 'retry';
                     }
 
+                    // One write for the whole group, whatever happened to it.
                     await locked(async () => {
                         const items = await store.load();
-                        const i = items.findIndex((x) => x.id === next.id);
-                        const current = items[i];
-                        if (!current) return;
-                        if (result === 'retry') items[i] = { ...current, attempts: current.attempts + 1 };
-                        else items.splice(i, 1);
-                        await store.save(items);
+                        const next =
+                            result === 'retry'
+                                ? items.map((x) => (ids.has(x.id) ? { ...x, attempts: x.attempts + 1 } : x))
+                                : items.filter((x) => !ids.has(x.id));
+                        await store.save(next);
                     });
                     // The server is down or throttling: everything behind this
                     // batch would fail the same way. The retry alarm resumes.
