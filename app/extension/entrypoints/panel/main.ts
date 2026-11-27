@@ -2,7 +2,9 @@ import '@/assets/ui.css';
 import { add, h } from '@/lib/dom';
 import type { PanelIssue, PanelProject, PanelRequest, PanelState, Reply, ReportResult } from '@/lib/messages';
 import { send } from '@/lib/messages';
+import { TICKET_PRIORITIES } from '@apexops/shared/types/tickets';
 import { isHostUiMessage, PANEL_MESSAGE_TAG, type PanelUiAction } from '@/lib/toolbarChannel';
+import { createVisibilityGate } from '@/lib/visibilityGate';
 
 /**
  * The toolbar's panel: an extension page inside an iframe on the site under
@@ -16,6 +18,17 @@ import { isHostUiMessage, PANEL_MESSAGE_TAG, type PanelUiAction } from '@/lib/to
  */
 
 const app = document.getElementById('app')!;
+
+// Switch and Report are refused while the page may be covering the panel (hardening H4).
+const gate = createVisibilityGate(
+    app,
+    undefined,
+    // The harness reads the browser's verdict from the frame; the page cannot (cross-origin).
+    import.meta.env.MODE === 'e2e' ? (v) => (document.documentElement.dataset.visible = `${v}@${Math.round(performance.now())}`) : undefined
+);
+const COVERED = 'Something on the page is covering this panel, so that click was not accepted. Close or move it, then try again.';
+/** Where the browser cannot tell (no IntersectionObserver v2): the slug waiting for a second, confirming click. */
+let confirmSwitch: string | null = null;
 
 let state: PanelState | null = null;
 let message: { kind: 'error' | 'ok'; text: string; link?: { href: string; label: string } } | null = null;
@@ -73,6 +86,13 @@ function report(): Promise<void> {
         render();
         return Promise.resolve();
     }
+    // A typed title is already something a borrowed click cannot supply, so
+    // without v2 there is no extra step here.
+    if (gate.state() === 'covered') {
+        message = { kind: 'error', text: COVERED };
+        render();
+        return Promise.resolve();
+    }
     return withBusy(async () => {
         const reply = await request<ReportResult>({ type: 'panel-report', title: draft.title, description: draft.description, priority: draft.priority });
         if (!reply.ok) throw new Error(reply.error.message);
@@ -105,6 +125,19 @@ function startSwitch(): Promise<void> {
 }
 
 function switchTo(slug: string): Promise<void> {
+    const g = gate.state();
+    if (g === 'covered') {
+        message = { kind: 'error', text: COVERED };
+        render();
+        return Promise.resolve();
+    }
+    if (g === 'unsupported' && confirmSwitch !== slug) {
+        confirmSwitch = slug;
+        message = { kind: 'ok', text: 'Click Switch again to confirm.' };
+        render();
+        return Promise.resolve();
+    }
+    confirmSwitch = null;
     return withBusy(async () => {
         const reply = await request<{ name: string }>({ type: 'panel-switch', slug });
         if (!reply.ok) throw new Error(reply.error.message);
@@ -220,7 +253,7 @@ function reportView(): HTMLElement {
     const priority = h(
         'select',
         { id: 'bug-priority', name: 'priority', onchange: (e: Event) => (draft.priority = (e.target as HTMLSelectElement).value) },
-        ...['low', 'medium', 'high', 'critical'].map((p) => h('option', { value: p, selected: p === draft.priority }, p[0]!.toUpperCase() + p.slice(1)))
+        ...TICKET_PRIORITIES.map((p) => h('option', { value: p, selected: p === draft.priority }, p[0]!.toUpperCase() + p.slice(1)))
     );
     return h(
         'section',
@@ -336,6 +369,7 @@ window.addEventListener('message', (e) => {
     if (e.source !== window.parent || !isHostUiMessage(e.data)) return;
     const wasVisible = visible;
     visible = e.data.visible;
+    if (visible !== wasVisible) gate.setShown(visible);
     if (visible && !wasVisible) void tick();
     if (visible && e.data.focus) {
         // Opened from the keyboard: start on the first control, not on nothing.

@@ -158,6 +158,55 @@ const inToolbarWorld = async (p, source) => {
     return r.exceptionDetails ? { error: r.exceptionDetails.exception?.description ?? r.exceptionDetails.text } : r.result.value;
 };
 
+/**
+ * `message` listeners on the page's window, the page's own plus the ApexOps
+ * world's: CDP lists a window's listeners per world, so both are asked.
+ */
+const messageListeners = async (p) => {
+    const cdp = await p.createCDPSession();
+    const contexts = [];
+    cdp.on('Runtime.executionContextCreated', ({ context }) => {
+        if (context.auxData?.frameId && (context.auxData.isDefault || (context.auxData.type === 'isolated' && context.name === 'ApexOps'))) contexts.push(context);
+    });
+    await cdp.send('Runtime.enable');
+    await sleep(200);
+    const top = (await cdp.send('Page.getFrameTree')).frameTree.frame.id;
+    let n = 0;
+    for (const c of contexts.filter((c) => c.auxData.frameId === top)) {
+        const { result } = await cdp.send('Runtime.evaluate', { expression: 'window', contextId: c.id });
+        const { listeners } = await cdp.send('DOMDebugger.getEventListeners', { objectId: result.objectId });
+        n += listeners.filter((l) => l.type === 'message').length;
+    }
+    await cdp.detach();
+    return n;
+};
+
+/**
+ * H4: Switch and Report are refused until the browser has reported the panel
+ * visible for 500 ms. A person takes longer than that to reach either button;
+ * the harness does not, so it waits as a person would.
+ */
+const panelSettled = (p) =>
+    until(
+        () =>
+            panelFrame(p).evaluate(() => {
+                const [v, at] = (document.documentElement.dataset.visible ?? '').split('@');
+                return v === 'true' && performance.now() - Number(at) > 700;
+            }),
+        5000,
+        100
+    );
+
+/** H4: what a clickjacking page does: lay a faint full-page layer over everything, letting clicks through. */
+const addOverlay = (p) =>
+    p.evaluate(() => {
+        const o = document.createElement('div');
+        o.id = 'jack';
+        o.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:rgba(255,0,0,0.05)';
+        document.documentElement.append(o); // after the toolbar host, so it paints above it
+    });
+const removeOverlay = (p) => p.evaluate(() => document.getElementById('jack')?.remove());
+
 const panelFrame = (p) => p.frames().find((f) => /\/panel\.html/.test(f.url()));
 /**
  * Open = the page sees far more of the toolbar host than a rail's worth.
@@ -299,12 +348,22 @@ try {
         `secret write -> ${JSON.stringify(quiet)}; toolbar change -> ${JSON.stringify(told)}`
     );
 
+    // ── C3. H4: a toolbar that was never opened adds no message listener to the page ──
+    const baseline = await messageListeners(unbound);
+    const closedCount = await messageListeners(site);
+
     // ── D. clicking the rail is not a click on the page ──
     const before = await site.evaluate(() => ({ doc: window.docClicks, page: window.pageClicks }));
     check('rail covers the page button in the corner before it is moved', (await site.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.tagName, await logoAt(site))) === 'APEXOPS-TOOLBAR');
     const opened = await openPanel(site);
     const after = await site.evaluate(() => ({ doc: window.docClicks, page: window.pageClicks }));
     check('clicking the ApexOps button opens the panel', !!opened);
+    const openCount = await messageListeners(site);
+    check(
+        'H4: closed and never opened, the toolbar adds no message listener (control: opening adds one)',
+        closedCount === baseline && openCount === baseline + 1,
+        `unbound page ${baseline}, bound closed ${closedCount}, after opening ${openCount}`
+    );
     check('...and the page\'s own click handlers never saw that click', after.doc === before.doc && after.page === before.page, JSON.stringify({ before, after }));
 
     // ── E. the panel: project, count, and nothing of it readable from the page ──
@@ -334,6 +393,7 @@ try {
     await f.type('#bug-title', `Button misaligned ${RUN}`);
     await f.type('#bug-description', 'The pay button overlaps the total.');
     await f.select('#bug-priority', 'high');
+    await panelSettled(site);
     await panelClick(site, 'Create ticket');
     t = (await waitPanelText(site, /Ticket TICK-\d+ created/, 10_000)) || (await panelText(site));
     const ticketId = (t.match(/Ticket (TICK-\d+) created/) ?? [])[1];
@@ -446,6 +506,7 @@ try {
     await panelClick(site, 'Switch project');
     await until(() => panelFrame(site).$('#switch-project'), 8000);
     await panelFrame(site).select('#switch-project', other.slug);
+    await panelSettled(site);
     await panelClick(site, 'Switch');
     t = (await waitPanelText(site, /now sends to/, 10_000)) || (await panelText(site));
     const tagK = `${RUN}-after-switch`;
@@ -458,8 +519,34 @@ try {
     await panelClick(site, 'Switch project');
     await until(() => panelFrame(site).$('#switch-project'), 8000);
     await panelFrame(site).select('#switch-project', SLUG);
+    await panelSettled(site);
     await panelClick(site, 'Switch');
     await waitPanelText(site, /now sends to/, 10_000);
+
+    // ── K2. H4: with the page laying something over the panel, Switch and Report are refused ──
+    await addOverlay(site);
+    await sleep(700); // longer than the observer's 100 ms delay
+    await panelClick(site, 'Switch project');
+    await until(() => panelFrame(site).$('#switch-project'), 8000);
+    await panelFrame(site).select('#switch-project', other.slug);
+    const slugBefore = (await stored('bindings')).bindings?.[SITE]?.slug;
+    await panelClick(site, 'Switch');
+    const refusedSwitch = await waitPanelText(site, /covering this panel/, 3000);
+    await sleep(500);
+    check(
+        'H4: covered panel: Switch is refused and the binding is unchanged',
+        !!refusedSwitch && (await stored('bindings')).bindings?.[SITE]?.slug === slugBefore,
+        `slug ${slugBefore} -> ${(await stored('bindings')).bindings?.[SITE]?.slug}`
+    );
+    await panelClick(site, 'Cancel');
+    await until(() => panelFrame(site).$('#bug-title'), 5000);
+    await panelFrame(site).type('#bug-title', `covered ${RUN}`);
+    await panelClick(site, 'Create ticket');
+    const refusedReport = await waitPanelText(site, /covering this panel/, 3000);
+    const keptTitle = await panelFrame(site).$eval('#bug-title', (e) => e.value).catch(() => null);
+    check('H4: covered panel: Report is refused and what was typed is kept', !!refusedReport && keptTitle === `covered ${RUN}`, `title field: ${keptTitle}`);
+    await removeOverlay(site);
+    await panelFrame(site).$eval('#bug-title', (e) => { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); }).catch(() => undefined);
 
     // ── L. the panel cannot do what only the popup may (R18), and vice versa ──
     const fromPanel = await panelFrame(site).evaluate((o) => chrome.runtime.sendMessage({ type: 'disconnect', siteOrigin: o }).then((r) => r ?? null, (e) => ({ rejected: true })), SITE);
@@ -520,7 +607,7 @@ try {
     const ms = Date.now() - t0;
     await panelClick(site, 'Refresh');
     const refreshed = await waitPanelText(site, /Recent issues/i, 10_000);
-    check('a page throwing 70 errors a second: the panel opens and answers', !!t && !!refreshed && ms < 8000, `${ms} ms to show the project`);
+    check('a page throwing 70 errors a second: the panel opens and answers', !!t && !!refreshed && ms < 8000, `${ms} ms to show the project` + (t ? '' : ` / panel: ${(await panelText(site)).replace(/\s+/g, ' ').slice(0, 140)}`));
     await site.goto(`${SITE}/`, { waitUntil: 'load' });
 
     // ── P. disconnect from the popup: the rail leaves the open page ──
