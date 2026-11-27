@@ -1,10 +1,11 @@
 /**
  * Where the toolbar sits on each site, and whether it is hidden there (spec 8.1 #8).
  *
- * Per origin, in `chrome.storage.local`. Written by the toolbar content script
- * (drag, hide) and by the popup (show again); both follow changes through
- * `storage.onChanged`, so hiding in one place hides it in every open tab of that
- * site. No ApexOps data lives here: it is a position and a flag.
+ * Per origin, in `chrome.storage.local`. Written by the worker for the toolbar
+ * (drag, hide — `toolbarState.ts`) and by the popup (show again). The worker
+ * pushes each change to that site's open tabs, so hiding in one place hides it
+ * in every tab of that site. The toolbar content script itself cannot read
+ * storage (hardening H2). No ApexOps data lives here: it is a position and a flag.
  */
 
 export interface ToolbarPref {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PANEL_PATH, PANEL_TYPES, POPUP_PATH, POPUP_TYPES, route, type SenderLike } from './router';
+import { PANEL_PATH, PANEL_TYPES, POPUP_PATH, POPUP_TYPES, route, TOOLBAR_TYPES, type SenderLike } from './router';
 
 /**
  * The trust boundary of the worker (spec R18). Every sender × message pairing
@@ -44,12 +44,26 @@ describe('ingest', () => {
     });
 });
 
+describe('toolbar', () => {
+    it.each([...TOOLBAR_TYPES])('%s comes from our content script, for the origin the browser reports', (type) => {
+        expect(go({ type, origin: 'https://victim.test' }, content)).toEqual({ kind: 'toolbar', origin: 'https://shop.example.test', tabId: 3 });
+    });
+
+    it.each([...TOOLBAR_TYPES])('%s is refused from extension pages and foreign senders', (type) => {
+        for (const sender of [popup, panel, { ...content, id: 'other' }, { ...content, tab: undefined }]) expect(go({ type }, sender)).toBeNull();
+    });
+
+    it('a content script may not send popup or panel requests', () => {
+        for (const type of [...POPUP_TYPES, ...PANEL_TYPES]) expect(go({ type }, content)).toBeNull();
+    });
+});
+
 describe('popup', () => {
     it.each([...POPUP_TYPES])('may send %s', (type) => {
         expect(go({ type }, popup)).toEqual({ kind: 'popup' });
     });
 
-    it.each([...PANEL_TYPES])('may not send %s', (type) => {
+    it.each([...PANEL_TYPES, ...TOOLBAR_TYPES])('may not send %s', (type) => {
         expect(go({ type }, popup)).toBeNull();
     });
 

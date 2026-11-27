@@ -14,6 +14,15 @@ export const TOOLBAR_COMMAND = 'toggle-toolbar';
 
 export const TOOLBAR_TOGGLE = 'apexops-toolbar-toggle';
 
+/**
+ * worker → toolbar content script, both with `origin` so a tab that has since
+ * navigated to another bound site ignores a message meant for the old one:
+ * `TOOLBAR_UPDATE` carries this site's new position or hidden flag;
+ * `TOOLBAR_UNBOUND` says the site was disconnected.
+ */
+export const TOOLBAR_UPDATE = 'apexops-toolbar-update';
+export const TOOLBAR_UNBOUND = 'apexops-toolbar-unbound';
+
 export const PANEL_MESSAGE_TAG = 'apexops-panel';
 
 export type PanelUiAction = 'close' | 'hide';

@@ -140,6 +140,24 @@ const logoAt = async (p) => {
     const r = await railPoint(p);
     return r ? { x: Math.round((r.left + r.right) / 2), y: Math.round(r.top + 16) } : null;
 };
+/**
+ * Runs `source` (an async function body) in the toolbar content script's own
+ * ISOLATED world — the T1 trust zone H2 closes storage to — and returns its value.
+ */
+const inToolbarWorld = async (p, source) => {
+    const cdp = await p.createCDPSession();
+    const ids = [];
+    cdp.on('Runtime.executionContextCreated', ({ context }) => {
+        if (context.auxData?.type === 'isolated' && context.name === 'ApexOps' && context.auxData?.isDefault === false) ids.push(context.id);
+    });
+    await cdp.send('Runtime.enable');
+    await sleep(200);
+    if (!ids.length) return { error: 'no ApexOps isolated world' };
+    const r = await cdp.send('Runtime.evaluate', { contextId: ids[ids.length - 1], expression: `(async () => { ${source} })()`, awaitPromise: true, returnByValue: true });
+    await cdp.detach();
+    return r.exceptionDetails ? { error: r.exceptionDetails.exception?.description ?? r.exceptionDetails.text } : r.result.value;
+};
+
 const panelFrame = (p) => p.frames().find((f) => /\/panel\.html/.test(f.url()));
 /**
  * Open = the page sees far more of the toolbar host than a rail's worth.
@@ -257,6 +275,30 @@ try {
     });
     check('the rail\'s shadow root is closed and the page\'s patched attachShadow did not capture it', hostInfo.shadowRoot && hostInfo.captured === 0, JSON.stringify(hostInfo));
 
+    // ── C2. H2: nothing in storage is readable from the toolbar's world ──
+    const read = await inToolbarWorld(site, `
+        try { const v = await chrome.storage.local.get(null); return { got: Object.keys(v) }; }
+        catch (e) { return { rejected: String(e.message ?? e) }; }`);
+    check("H2: storage.local.get from the toolbar's world is refused", !!read?.rejected, JSON.stringify(read).slice(0, 120));
+    // Listen in that world, then change a stored secret the way a token rotation does.
+    await inToolbarWorld(site, `
+        window.__h2 = { changed: 0, messages: 0 };
+        chrome.storage.onChanged.addListener(() => window.__h2.changed++);
+        chrome.runtime.onMessage.addListener(() => { window.__h2.messages++; });
+        return true;`);
+    await sw.evaluate((v) => chrome.storage.local.set({ h2probe: v }), `secret-${RUN}`);
+    await sleep(1500);
+    const quiet = await inToolbarWorld(site, 'return window.__h2;');
+    // Control, same listeners: a toolbar change for this site does arrive.
+    await sw.evaluate((o) => chrome.storage.local.get('toolbarPrefs').then((v) => chrome.storage.local.set({ toolbarPrefs: { ...(v.toolbarPrefs ?? {}), [o]: { right: 16, bottom: 16 } } })), SITE);
+    const told = await until(async () => ((await inToolbarWorld(site, 'return window.__h2;'))?.messages ?? 0) > 0 && (await inToolbarWorld(site, 'return window.__h2;')), 5000);
+    await sw.evaluate(() => chrome.storage.local.remove('h2probe'));
+    check(
+        "H2: a secret written to storage reaches the toolbar's world zero times (control: a toolbar change does)",
+        quiet?.changed === 0 && quiet?.messages === 0 && !!told && told.messages >= 1,
+        `secret write -> ${JSON.stringify(quiet)}; toolbar change -> ${JSON.stringify(told)}`
+    );
+
     // ── D. clicking the rail is not a click on the page ──
     const before = await site.evaluate(() => ({ doc: window.docClicks, page: window.pageClicks }));
     check('rail covers the page button in the corner before it is moved', (await site.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.tagName, await logoAt(site))) === 'APEXOPS-TOOLBAR');
@@ -337,6 +379,12 @@ try {
     check('a forged "hide" posted by the page is ignored', !!(await railPoint(site)) && !(await stored('toolbarPrefs')).toolbarPrefs?.[SITE]?.hidden);
 
     // ── I. drag it out of the way; the page button works; the place is remembered ──
+    // A second tab of the same site follows live (H2: pushed by the worker, not read from storage).
+    const site2 = await browser.newPage();
+    await site2.setViewport({ width: 1280, height: 800 });
+    await site2.goto(`${SITE}/`, { waitUntil: 'load' });
+    await until(() => railPoint(site2), 5000);
+    await site.bringToFront();
     const at = await logoAt(site);
     await site.mouse.move(at.x, at.y);
     await site.mouse.down();
@@ -345,6 +393,13 @@ try {
     await sleep(500);
     const r1 = await railPoint(site);
     check('dragged: the rail moved and the panel did not open', !!r1 && r1.right < r0.right - 500 && !(await panelOpen(site)), r1 ? `now at ${r1.left},${r1.top}` : 'gone');
+    const gap = (r) => r && { x: r.vw - r.right, y: r.vh - r.bottom };
+    const followed = await until(async () => {
+        const a = gap(await railPoint(site));
+        const b = gap(await railPoint(site2));
+        return a && b && Math.abs(a.x - b.x) <= 6 && Math.abs(a.y - b.y) <= 6 && b;
+    }, 5000);
+    check('H2: a second tab of the same site moves its rail too, without a reload', !!followed, followed ? `second tab gap ${followed.x},${followed.y}` : JSON.stringify(gap(await railPoint(site2))));
     const clicksBefore = await site.evaluate(() => window.pageClicks);
     await site.click('#corner');
     check('the site\'s own button in that corner is clickable now', (await site.evaluate(() => window.pageClicks)) === clicksBefore + 1);
@@ -420,6 +475,7 @@ try {
     await sleep(1200);
     const stillHidden = !(await railPoint(site));
     check('hide: the rail goes, and stays gone after a reload', !!hidden && stillHidden);
+    check('H2: ...and the second tab of the site hides too, live', !!(await until(async () => !(await railPoint(site2)), 3000)));
     const pop = await browser.newPage();
     pop.on('pageerror', (e) => console.log(`popup error: ${e.message}`));
     pop.on('console', (m) => m.type() === 'error' && console.log(`popup console: ${m.text()}`));
@@ -435,6 +491,8 @@ try {
     });
     const back = await until(() => railPoint(site), 5000);
     check('the popup offers "Show toolbar" and the rail comes back live', showBtn && !!back);
+    check('H2: ...in the second tab as well', !!(await until(() => railPoint(site2), 5000)));
+    await site2.close();
     await pop.close();
 
     // ── N. signed out: the panel asks to sign in, naming the host; signing in works ──
