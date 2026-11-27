@@ -7,11 +7,11 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
       POSTGRES_DB: ${PG_DATABASE:-apexops_db}
     ports:
-      - "${PG_PORT:-5432}:5432"
+      - '${PG_PORT:-5432}:5432'
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      test: ['CMD-SHELL', 'pg_isready -U ${PG_USER:-postgres}']
       interval: 5s
       timeout: 5s
       retries: 10
@@ -27,21 +27,40 @@ services:
     image: axllent/mailpit:latest
     restart: unless-stopped
     ports:
-      - "${SMTP_PORT:-1025}:1025"   # SMTP
-      - "${MAILPIT_UI_PORT:-8025}:8025"  # web UI + JSON API
+      - '${SMTP_PORT:-1025}:1025' # SMTP
+      - '${MAILPIT_UI_PORT:-8025}:8025' # web UI + JSON API
     environment:
       MP_MAX_MESSAGES: 500
       MP_SMTP_AUTH_ACCEPT_ANY: 1
       MP_SMTP_AUTH_ALLOW_INSECURE: 1
 
+  # Applies database/prisma/migrations, then exits. The API waits for it.
+  #
+  # A database whose tables were created earlier with `prisma db push` has no
+  # migration history, and this fails with P3005. Mark the baseline as applied,
+  # once:  docker compose run --rm migrate npx --no-install prisma migrate resolve --applied 0_init
+  migrate:
+    build:
+      context: .
+      dockerfile: app/server/Dockerfile
+      target: migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@db:5432/${PG_DATABASE:-apexops_db}?schema=public
+
   server:
     build:
       context: .
       dockerfile: app/server/Dockerfile
+      target: run
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       PORT: 3000
@@ -51,20 +70,22 @@ services:
       JWT_EXPIRY: ${JWT_EXPIRY:-1h}
       JWT_REFRESH_EXPIRY: ${JWT_REFRESH_EXPIRY:-7d}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+      AI_KEY_SECRET: ${AI_KEY_SECRET}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
     ports:
-      - "3000:3000"
+      - '3000:3000'
 
   client:
     build:
-      context: ./app/client
+      context: .
+      dockerfile: app/client/Dockerfile
       args:
         VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
     restart: unless-stopped
     depends_on:
       - server
     ports:
-      - "80:80"
+      - '80:80'
 
 volumes:
   db_data:
