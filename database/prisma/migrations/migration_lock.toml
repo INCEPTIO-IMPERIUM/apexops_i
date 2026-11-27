@@ -1,0 +1,2 @@
+# Prisma writes this file; commit it. Changing the provider needs a new migration history.
+provider = "postgresql"
