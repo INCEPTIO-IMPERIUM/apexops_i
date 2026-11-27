@@ -5,7 +5,10 @@
  *
  * Counted when the worker accepts a batch, which is also when it is queued for
  * delivery. `storage.session` because a tab id means nothing after a restart;
- * the worker forgets a tab when it closes.
+ * the worker forgets a tab when it closes, and when it starts loading a new page.
+ *
+ * Keyed by tab AND origin (hardening H3): a tab that moves from one bound site
+ * to another must not show the first site's count on the second.
  */
 
 const KEY = 'tabCounts';
@@ -27,15 +30,14 @@ function update(change: (c: Counts) => Counts): Promise<void> {
     return run;
 }
 
-export const countEvents = (tabId: number, n: number): Promise<void> =>
-    n > 0 ? update((c) => ({ ...c, [tabId]: (c[tabId] ?? 0) + n })) : Promise.resolve();
+const keyOf = (tabId: number, origin: string) => `${tabId}|${origin}`;
+
+export const countEvents = (tabId: number, origin: string, n: number): Promise<void> =>
+    n > 0 ? update((c) => ({ ...c, [keyOf(tabId, origin)]: (c[keyOf(tabId, origin)] ?? 0) + n })) : Promise.resolve();
 
 export const forgetTab = (tabId: number): Promise<void> =>
-    update((c) => {
-        const { [tabId]: _gone, ...rest } = c;
-        return rest;
-    });
+    update((c) => Object.fromEntries(Object.entries(c).filter(([k]) => !k.startsWith(`${tabId}|`))));
 
-export async function eventsFromTab(tabId: number): Promise<number> {
-    return (await read())[tabId] ?? 0;
+export async function eventsFromTab(tabId: number, origin: string): Promise<number> {
+    return (await read())[keyOf(tabId, origin)] ?? 0;
 }

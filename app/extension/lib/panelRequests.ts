@@ -67,7 +67,7 @@ async function call(b: Binding, path: string, init: Parameters<typeof fetchWithA
 }
 
 async function state(ctx: PanelContext, site: string, b: Binding): Promise<PanelState> {
-    const [session, problems, events, current] = await Promise.all([whoami(), readIngestProblems(), eventsFromTab(ctx.tabId), storedApiUrl()]);
+    const [session, problems, events, current] = await Promise.all([whoami(), readIngestProblems(), eventsFromTab(ctx.tabId, site), storedApiUrl()]);
     return {
         bound: true,
         site,

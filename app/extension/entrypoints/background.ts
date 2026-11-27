@@ -1,5 +1,5 @@
 import { setClientLabel } from '@apexops/shared/api';
-import { readBindings, BINDINGS_KEY, type Binding } from '@/lib/bindings';
+import { BINDINGS_KEY, invalidateBindingsCache, readBindingsCached, type Binding } from '@/lib/bindings';
 import { refreshBindingKey } from '@/lib/connect';
 import { clearIngestProblem, recordIngestProblem } from '@/lib/ingestProblems';
 import { createIngestQueue, type QueueItem, type SendResult } from '@/lib/ingestQueue';
@@ -9,6 +9,7 @@ import { route } from '@/lib/router';
 import { syncRegistrations } from '@/lib/registration';
 import { handleRequest } from '@/lib/requests';
 import { sanitizeBatch } from '@/lib/sanitize';
+import { createTabBucket } from '@/lib/tabBucket';
 import { ensureSession } from '@/lib/session';
 import { countEvents, forgetTab } from '@/lib/tabCounts';
 import { TOOLBAR_COMMAND, TOOLBAR_TOGGLE } from '@/lib/toolbarChannel';
@@ -48,7 +49,7 @@ async function post(binding: Binding, item: QueueItem): Promise<Response> {
 }
 
 async function deliver(item: QueueItem): Promise<SendResult> {
-    const binding = (await readBindings())[item.origin];
+    const binding = (await readBindingsCached())[item.origin];
     // Unbound since it was captured: the user no longer wants this site sent.
     if (!binding) return 'drop';
 
@@ -58,7 +59,8 @@ async function deliver(item: QueueItem): Promise<SendResult> {
     // learn the new one from the API (spec X13) — once, then try again straight
     // away rather than waiting for the retry alarm.
     if (res.status === 401 && (await refreshBindingKey(item.origin)) === 'changed') {
-        const fresh = (await readBindings())[item.origin];
+        invalidateBindingsCache();
+        const fresh = (await readBindingsCached())[item.origin];
         if (fresh) res = await post(fresh, item);
     }
 
@@ -79,13 +81,18 @@ async function deliver(item: QueueItem): Promise<SendResult> {
     return 'drop';
 }
 
+const buckets = createTabBucket();
+
 async function onIngest(body: unknown, origin: string, tabId: number): Promise<void> {
-    if (!(await readBindings())[origin]) return;
+    // Before any storage is touched: a flood is cut in memory (hardening H3).
+    if (!buckets.take(tabId)) return;
+    if (!(await readBindingsCached())[origin]) return;
 
     const events = sanitizeBatch(body);
     await queue.enqueue(origin, events);
-    await countEvents(tabId, events.length);
-    await queue.flush();
+    // Delivery first; the panel's count is a nicety and waits for nothing.
+    void queue.flush();
+    void countEvents(tabId, origin, events.length);
 }
 
 type Respond = (reply: unknown) => void;
@@ -166,13 +173,23 @@ export default defineBackground(() => {
 
     browser.commands.onCommand.addListener((command) => void onCommand(command));
     browser.tabs.onRemoved.addListener((tabId) => {
+        buckets.forget(tabId);
         void forgetTab(tabId);
         void forgetToolbarTab(tabId);
+    });
+    // A new page in the tab starts its count again (and its rate allowance).
+    browser.tabs.onUpdated.addListener((tabId, change) => {
+        if (change.status !== 'loading') return;
+        buckets.forget(tabId);
+        void forgetTab(tabId);
     });
 
     browser.storage.onChanged.addListener((changes, area) => {
         if (area !== 'local') return;
-        if (changes[BINDINGS_KEY]) void syncRegistrations();
+        if (changes[BINDINGS_KEY]) {
+            invalidateBindingsCache();
+            void syncRegistrations();
+        }
         void pushToolbarChanges(changes);
     });
 

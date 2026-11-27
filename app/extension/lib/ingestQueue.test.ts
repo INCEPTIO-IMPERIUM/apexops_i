@@ -59,8 +59,9 @@ describe('ingest queue', () => {
             },
             id
         );
+        // Two sites, so the second batch is its own request and must wait.
         await q.enqueue('https://a.test', evs(1, 'a'));
-        await q.enqueue('https://a.test', evs(1, 'b'));
+        await q.enqueue('https://b.test', evs(1, 'b'));
         await q.flush();
         expect(calls).toHaveLength(1);
         expect(store.peek().map((i) => i.attempts)).toEqual([1, 0]);
@@ -131,7 +132,7 @@ describe('ingest queue', () => {
             id
         );
         await q.enqueue('https://a.test', evs(1));
-        await q.enqueue('https://a.test', evs(1));
+        await q.enqueue('https://b.test', evs(1));
         await Promise.all([q.flush(), q.flush(), q.flush()]);
         expect(sent).toHaveLength(2);
         expect(new Set(sent).size).toBe(2);
@@ -145,5 +146,56 @@ describe('ingest queue', () => {
         expect(items.reduce((t, i) => t + i.events.length, 0)).toBeLessThanOrEqual(MAX_QUEUED_EVENTS);
         expect(items.at(-1)?.events[0]?.message).toBe('b14-0');
         expect(items[0]?.events[0]?.message).not.toBe('b0-0');
+    });
+
+    it("coalesces one site's queued batches into one request, with one queue write", async () => {
+        const store = memoryStore();
+        let writes = 0;
+        const counting = { load: store.load, save: async (items: QueueItem[]) => (writes++, store.save(items)) };
+        const sent: QueueItem[] = [];
+        const q = createIngestQueue(counting, async (item) => (sent.push(item), 'sent'), id);
+        for (let i = 0; i < 5; i++) await q.enqueue('https://a.test', evs(1, `a${i}-`));
+        writes = 0;
+        await q.flush();
+        expect(sent).toHaveLength(1);
+        expect(sent[0]!.events.map((e) => e.message)).toEqual(['a0-0', 'a1-0', 'a2-0', 'a3-0', 'a4-0']);
+        expect(writes).toBe(1);
+        expect(store.peek()).toEqual([]);
+    });
+
+    it('never puts two sites in one request, and keeps each request within 100 events', async () => {
+        const store = memoryStore();
+        const sent: QueueItem[] = [];
+        const q = createIngestQueue(store, async (item) => (sent.push(item), 'sent'), id);
+        await q.enqueue('https://a.test', evs(60, 'a'));
+        await q.enqueue('https://b.test', evs(1, 'b'));
+        await q.enqueue('https://a.test', evs(60, 'c'));
+        await q.flush();
+        expect(sent.map((s) => [s.origin, s.events.length])).toEqual([
+            ['https://a.test', 60],
+            ['https://b.test', 1],
+            ['https://a.test', 60],
+        ]);
+    });
+
+    it('a failed coalesced request keeps every batch in it, each with one more attempt', async () => {
+        const store = memoryStore();
+        const q = createIngestQueue(store, async () => 'retry' as SendResult, id);
+        await q.enqueue('https://a.test', evs(1));
+        await q.enqueue('https://a.test', evs(1));
+        await q.flush();
+        expect(store.peek().map((i) => i.attempts)).toEqual([1, 1]);
+    });
+
+    it("a flooding site cannot push out another site's events (D3)", async () => {
+        const store = memoryStore();
+        const q = createIngestQueue(store, async () => 'retry' as SendResult, id);
+        await q.enqueue('https://quiet.test', evs(10, 'q'));
+        for (let i = 0; i < 30; i++) await q.enqueue('https://noisy.test', evs(100, `n${i}-`));
+        const items = store.peek();
+        expect(items.filter((i) => i.origin === 'https://quiet.test').flatMap((i) => i.events)).toHaveLength(10);
+        expect(items.reduce((n, i) => n + i.events.length, 0)).toBeLessThanOrEqual(MAX_QUEUED_EVENTS);
+        // The noisy site kept its newest batches.
+        expect(items.at(-1)!.events[0]!.message).toBe('n29-0');
     });
 });
