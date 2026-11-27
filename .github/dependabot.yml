@@ -1,0 +1,30 @@
+# Keeps the commit pins in the workflows and the images and packages current.
+# Grouped, so a week of updates is a few pull requests rather than dozens.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker
+    directories: [/app/server, /app/client]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

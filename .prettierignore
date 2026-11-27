@@ -1,0 +1,11 @@
+# Generated or vendored.
+package-lock.json
+**/dist/
+**/.output/
+**/.wxt/
+**/coverage/
+app/server/public/sdk/v1.js
+database/prisma/migrations/
+# Prose and the build harness keep their own layout.
+*.md
+.agents/
