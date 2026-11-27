@@ -925,6 +925,56 @@
       "notes": "VERIFIED 2026-11-01 on branch ext/p5a-h1-router. Chrome for Testing 131 is not installed on this machine now, so the browser checks ran on Edge only. Deviations from the plan: no 'toolbar' route class yet (nothing sends it; H2 adds it with its sender); ingest from a tab with no id is now refused (it was counted under tab -1). Server 400 confirmed in api/tickets.ts (non-member -> 'Project not found' with 400)."
     },
     {
+      "id": "P5a-H2",
+      "title": "Nothing secret is readable from a content script (hardening H2)",
+      "priority": "critical",
+      "depends_on": [
+        "P5a-H1"
+      ],
+      "description": "Worker calls storage.local/session.setAccessLevel(TRUSTED_CONTEXTS) at start. Toolbar reads no storage: toolbar-state / toolbar-pref to the worker for the sender's own origin; worker pushes position, hidden and unbound changes to that origin's tabs only (lib/toolbarState.ts).",
+      "steps": [
+        "Spike (spikes/h2-access-level): Edge 158, locked = content script get rejects and onChanged silent; control unlocked = secret read and rotation delivered",
+        "p5a: storage.local.get from the toolbar's world rejects; a secret written reaches that world 0 times (control: a toolbar change arrives once); second tab follows drag, hide and show live",
+        "Mutation: lock removed -> 42/44, the toolbar world reads accessToken, refreshToken, bindings",
+        "Unit: toolbarState.test.ts; mutations (push on any change, unchanged origins told, unbound write, px check off) each red"
+      ],
+      "passes": true,
+      "notes": "VERIFIED 2026-11-27, Edge 158 only (Chrome for Testing not installed). D1 needed no answer: setAccessLevel works on local, so nothing moved store. NOT measured: whether the access level persists across a browser restart before the worker wakes (a content script running before the worker's first start); the toolbar no longer reads storage either way, so the exposure is only the lock's, not a read."
+    },
+    {
+      "id": "P5a-H3",
+      "title": "The ingest hot path is bounded (hardening H3)",
+      "priority": "high",
+      "depends_on": [
+        "P5a-H1"
+      ],
+      "description": "Per-tab token bucket in memory before any storage read (20 burst, 5/s); bindings cached in memory; flush coalesces one site's batches into one request (<=100 events) with one queue write; eviction protects other sites (D3: a site over half the queue loses its own oldest first); counts keyed tab|origin, reset on loading.",
+      "steps": [
+        "checks/h3-flood.mjs, 1,000 events in 1 s, Edge 158: queue empty 82.6 s -> ~1 s; API requests 1,000 -> 6; storage reads 7,001 -> 72; writes 4,000 -> 60; 24 events accepted, the rest dropped in memory",
+        "Unit: ingestQueue (fairness, coalescing, retry keeps the group), tabBucket, tabCounts; mutations each red",
+        "p3 14/14, p4 34/34, p5a 44/44 on Edge"
+      ],
+      "passes": true,
+      "notes": "VERIFIED 2026-11-27. Beyond the plan: coalescing, which is what made the request rate flat (the bucket alone would still send one request per batch). Worker CPU time not measured: Performance.getMetrics returns nothing for an extension worker. Bucket drops are counted in memory and shown nowhere yet."
+    },
+    {
+      "id": "P5a-H4",
+      "title": "The panel refuses borrowed clicks and stays quiet (hardening H4)",
+      "priority": "high",
+      "depends_on": [
+        "P5a-H1"
+      ],
+      "description": "IntersectionObserver v2 gate (lib/visibilityGate.ts): Switch and Report need 500 ms of browser-reported visibility; no v2 -> Switch takes a confirming second click (D2 default). Toolbar message listener only once the panel exists; Esc respects defaultPrevented; priorities from @apexops/shared/types/tickets with a server drift test.",
+      "steps": [
+        "p5a 47/47: overlay -> Switch refused, binding unchanged; Report refused, title kept; never-opened toolbar 0 message listeners (control: 1 after opening)",
+        "Mutation: gate always ok + eager listener -> 43/47; the covered Switch moved the binding and the covered Report filed a ticket",
+        "Unit: visibilityGate.test.ts; server ticketPriorities.test.ts red when the server list changes",
+        "p3 14/14, p4 34/34; extension 164, server 167 tests; shipped build"
+      ],
+      "passes": true,
+      "notes": "VERIFIED 2026-11-27, Edge 158. The harness now waits for the panel to settle before Switch/Report (panelSettled); its 200 ms clicks were refused by the gate, which is the gate working. The confirm fallback (no v2) is unit-level only: Chromium always has v2, Firefox (P7) is where it would run. The mutation run left one ticket titled 'covered p5a-...' in the rig database."
+    },
+    {
       "id": "P5b",
       "title": "Vendored VisBug tools + Report bug with element",
       "priority": "high",

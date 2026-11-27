@@ -1,7 +1,9 @@
 # P5a hardening — safety and efficiency plan
 
-Written 2026-09-28, after the P5a review (commit `4ef8ac6`). Status: **plan only.
-Nothing is built yet.** The three decisions in §4 must be answered before H1 starts.
+Written 2026-09-28, after the P5a review (commit `4ef8ac6`). **Status 2026-11-27: H1–H4
+built and merged into `ext/dev`** (ledger P5a-H1..H4). The §4 decisions took their defaults:
+D1 needed no answer (the spike showed `setAccessLevel` works on `local`, Edge 158), D2 = (a)
+with (b) as the fallback, D3 = the noisy site loses its own oldest first. Verified on Edge only.
 
 ## 1. System points — every place data crosses a boundary
 
