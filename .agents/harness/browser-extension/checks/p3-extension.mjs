@@ -12,6 +12,7 @@
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { extensionWorker } from './extension-worker.mjs';
 
 const root = new URL('../../../../', import.meta.url);
 const require = createRequire(new URL('app/server/package.json', root));
@@ -128,16 +129,13 @@ await new Promise((r) => proxy.listen(8795, '127.0.0.1', r));
 const EDGE = process.env.P3_BROWSER === 'edge';
 const browser = await puppeteer.launch({
     headless: false,
-    executablePath: EDGE ? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' : undefined,
+    // CHROME_PATH picks a Chrome for Testing other than puppeteer's pinned one, which is older than the
+    // manifest's minimum_chrome_version.
+    executablePath: EDGE ? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' : process.env.CHROME_PATH || undefined,
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, '--window-position=-2400,0'],
 });
 
-const worker = async () => {
-    const t = await browser.waitForTarget((t) => t.type() === 'service_worker' && t.url().endsWith('/background.js'), {
-        timeout: 15_000,
-    });
-    return t.worker();
-};
+const worker = async () => (await extensionWorker(browser)).worker;
 
 /** Opens a page and records the extension isolated worlds created in it. */
 const open = async (url) => {

@@ -23,6 +23,9 @@ export default defineConfig({
     manifest: ({ mode }) => ({
         name: 'ApexOps',
         description: 'Capture errors and inspect UI on the site you are testing, straight into an ApexOps project.',
+        // The first version with `storage.local.setAccessLevel`, which keeps
+        // tokens and ingest keys away from content scripts (lib/lockStorage.ts).
+        minimum_chrome_version: '140',
         permissions: ['storage', 'scripting', 'alarms', 'activeTab'],
         optional_host_permissions: ['http://*/*', 'https://*/*'],
         // The toolbar's panel (spec X10) is framed into bound sites. The list of

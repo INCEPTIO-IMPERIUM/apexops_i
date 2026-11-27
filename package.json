@@ -20,6 +20,13 @@
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f",
     "test": "npm run test --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test:coverage": "npm run test --workspaces --if-present -- --coverage",
+    "format:changed": "node .github/scripts/format-changed.mjs --write",
+    "format:check": "node .github/scripts/format-changed.mjs"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "3.2.7",
+    "prettier": "3.10.1"
   }
 }

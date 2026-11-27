@@ -30,6 +30,15 @@ export default defineConfig({
     },
     test: {
         environment: 'node',
+        coverage: {
+            // Every source file, not only the ones a test happens to import.
+            include: ['src/**/*.{ts,tsx}'],
+            exclude: ['**/*.test.*', '**/*.d.ts'],
+            reporter: ['text-summary', 'json-summary', 'lcov'],
+            // A floor just under what was measured when it was set, so coverage
+            // cannot quietly fall. Raise it as tests arrive; never lower it to pass.
+            thresholds: { statements: 12, branches: 85, functions: 43, lines: 12 },
+        },
         include: ['src/**/*.test.{ts,tsx}'],
         testTimeout: 5_000,
     },

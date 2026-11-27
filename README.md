@@ -86,6 +86,15 @@ npm run db:generate     # prisma generate
 # npm run db:studio     # open Prisma Studio
 ```
 
+The schema has a migration history in `database/prisma/migrations/`. After
+changing `schema.prisma`, create its migration with `npm run db:migrate` and
+commit it; CI fails if the two differ. A database that was built earlier with
+`prisma db push` has no history yet — mark the baseline as already applied, once:
+
+```bash
+npx prisma migrate resolve --applied 0_init
+```
+
 ### 4. Run the app
 
 ```bash

@@ -2,6 +2,7 @@ import { setClientLabel } from '@apexops/shared/api';
 import { BINDINGS_KEY, invalidateBindingsCache, readBindingsCached, type Binding } from '@/lib/bindings';
 import { refreshBindingKey } from '@/lib/connect';
 import { clearIngestProblem, recordIngestProblem } from '@/lib/ingestProblems';
+import { lockStorage } from '@/lib/lockStorage';
 import { createIngestQueue, type QueueItem, type SendResult } from '@/lib/ingestQueue';
 import type { PanelRequest, Request } from '@/lib/messages';
 import { handlePanelRequest } from '@/lib/panelRequests';
@@ -36,7 +37,7 @@ const queue = createIngestQueue(
         load: async () => ((await browser.storage.session.get(QUEUE_KEY))[QUEUE_KEY] as QueueItem[]) ?? [],
         save: (items) => browser.storage.session.set({ [QUEUE_KEY]: items }),
     },
-    deliver
+    deliver,
 );
 
 async function post(binding: Binding, item: QueueItem): Promise<Response> {
@@ -115,26 +116,11 @@ async function onCommand(command: string): Promise<void> {
     await browser.tabs.sendMessage(tab.id, { type: TOOLBAR_TOGGLE }).catch(() => undefined);
 }
 
-/**
- * Close `storage.local` to content scripts (hardening H2). It holds the session
- * tokens and every bound site's ingest key, and by default any content script
- * — code in a site's renderer — can read it and hear every change to it.
- * `storage.session` is closed by default; set anyway so the rule is written here.
- *
- * Measured on Edge 158: after this, `storage.local.get` from a content script
- * rejects and `onChanged` delivers nothing there; without it, both leak
- * (spikes/h2-access-level). Not measured on Chrome.
- */
-function lockStorage(): void {
-    for (const area of [browser.storage.local, browser.storage.session]) {
-        void area.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }).catch((err: unknown) => console.error('[apexops] could not restrict storage', err));
-    }
-}
-
 export default defineBackground(() => {
     // First, before any listener can run code that writes a secret.
-    lockStorage();
-    browser.runtime.onInstalled.addListener(lockStorage);
+    const lock = () => lockStorage({ local: browser.storage.local, session: browser.storage.session });
+    lock();
+    browser.runtime.onInstalled.addListener(lock);
 
     // Before anything can log in or refresh: every session this worker mints or
     // rotates is labelled as the extension's (spec F12).
@@ -160,10 +146,7 @@ export default defineBackground(() => {
 
         if (where.kind === 'panel') {
             const tab = sender.tab!;
-            void answer(
-                () => handlePanelRequest(message as PanelRequest, { version, tabId: where.tabId, tabUrl: tab.url ?? null, tabTitle: tab.title ?? '' }),
-                sendResponse
-            );
+            void answer(() => handlePanelRequest(message as PanelRequest, { version, tabId: where.tabId, tabUrl: tab.url ?? null, tabTitle: tab.title ?? '' }), sendResponse);
             return true;
         }
 

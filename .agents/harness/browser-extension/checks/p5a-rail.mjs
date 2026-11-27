@@ -12,6 +12,7 @@
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { extensionWorker } from './extension-worker.mjs';
 
 const root = new URL('../../../../', import.meta.url);
 const require = createRequire(new URL('app/server/package.json', root));
@@ -104,13 +105,15 @@ const servers = [SITE, SITE_UNBOUND].map((o) =>
 
 const browser = await puppeteer.launch({
     headless: false,
-    executablePath: EDGE ? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' : undefined,
+    // CHROME_PATH picks a Chrome for Testing other than puppeteer's pinned one, which is older than the
+    // manifest's minimum_chrome_version.
+    executablePath: EDGE ? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' : process.env.CHROME_PATH || undefined,
     defaultViewport: { width: 1280, height: 800 },
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, '--window-position=-2400,0', '--window-size=1300,900'],
 });
 
-const swTarget = () => browser.waitForTarget((t) => t.type() === 'service_worker' && t.url().endsWith('/background.js'), { timeout: 15_000 });
-const sw = await (await swTarget()).worker();
+const swTarget = async () => (await extensionWorker(browser)).target;
+const sw = (await extensionWorker(browser)).worker;
 const EXT_ID = new URL((await swTarget()).url()).host;
 const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 const stored = (keys) => sw.evaluate((k) => chrome.storage.local.get(k), keys);

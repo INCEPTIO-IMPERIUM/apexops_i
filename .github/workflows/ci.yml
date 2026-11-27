@@ -2,75 +2,487 @@ name: CI
 
 # Checks only (spec E-D3). Pull requests and pushes to main, and nothing else.
 #
-# **This workflow must never deploy, publish, or release.** This repository had no
-# pipeline at all before 2026-08-04; the first one must not be something that
-# ships code as a side effect of a merge. Adding delivery later is a decision
-# somebody should make deliberately, in its own file, with its own review — not
-# something that accretes onto a check job.
+# **This workflow must never deploy, publish, or release.** Delivery is a
+# decision somebody should make deliberately, in its own file, with its own
+# review — not something that accretes onto a check workflow. It builds Docker
+# images and throws them away.
 #
-# It is also written to need **no secrets**, so a pull request from a fork runs
-# the same checks as one from a branch. A CI job that silently skips its real
-# work on external contributions is worse than none: it reports green.
+# It needs **no repository secrets**, so a pull request from a fork runs the same
+# checks as one from a branch. Every credential below is a throwaway for a
+# database or a stack that lives only for its job.
+#
+# Branch protection should require exactly one check: `CI gate`.
+#
+# Third-party actions are pinned to a commit, with the tag in a comment; a tag can
+# be moved, a commit cannot. Dependabot (.github/dependabot.yml) raises the pins.
 on:
   pull_request:
   push:
     branches: [main]
 
-# Cancel superseded runs on the same ref. Pushing three times to a PR should not
-# queue three full runs.
+# Cancel superseded runs of a pull request. A run on main is never cancelled:
+# each merged commit keeps its own verdict.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+env:
+  NODE_VERSION: '22'
+
 jobs:
-  check:
-    name: typecheck · lint · test · build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+  # ── what changed ───────────────────────────────────────────
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.areas.outputs.code }}
+      docker: ${{ steps.areas.outputs.docker }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '22'
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: areas
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        # Unknown base (a new branch, a force push) means "everything changed":
+        # skipping a check must never be what a missing answer leads to.
+        run: |
+          if ! files=$(git diff --name-only "$BASE...HEAD" 2>/dev/null); then
+            echo 'base unknown: running everything'
+            { echo 'code=true'; echo 'docker=true'; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$files"
+          code=false; docker=false
+          if echo "$files" | grep -qvE '(\.md$|^\.agents/docs/)'; then code=true; fi
+          if echo "$files" | grep -qE '^(app/(client|server)/|packages/|database/|docker-compose\.yml|\.dockerignore|package(-lock)?\.json|\.github/)'; then docker=true; fi
+          { echo "code=$code"; echo "docker=$docker"; } >> "$GITHUB_OUTPUT"
+
+  # ── checks that need no build ──────────────────────────────
+  static:
+    name: Format, lint, typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
+      # `npm ci` and not `npm install`: run against the lockfile, not against
+      # whatever resolves today.
+      - run: npm ci
+      # Explicit although postinstall does it: a missing client fails as a type
+      # error about a package that is installed, which is confusing to debug.
+      - run: npm run db:generate --workspace app/server
 
-      # `npm ci` and not `npm install`: the point of CI is to run against the
-      # lockfile, not against whatever resolves today.
-      - name: Install
-        run: npm ci
-
-      # The server imports `@prisma/client` at module load, so the generated
-      # client must exist before anything typechecks. `npm ci` runs the server's
-      # postinstall, which does this — but it is repeated explicitly because a
-      # missing client fails with a type error about a package that is installed,
-      # which is a genuinely confusing thing to debug from a CI log.
-      - name: Generate Prisma client
-        run: npm run db:generate --workspace app/server
-
-      - name: Typecheck (all workspaces)
-        run: npm run typecheck --workspaces --if-present
+      - name: Format (changed files)
+        env:
+          FORMAT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: npm run format:check
 
       - name: Lint (client)
         run: npm run lint --workspace app/client
 
-      # All suites are pure functions — no database, no server, no .env. If a
-      # test here ever needs one of those, it is an integration test and this job
-      # gains a service container as a deliberate, reviewed change.
-      - name: Test (all workspaces)
-        run: npm run test --workspaces --if-present
+      - name: Typecheck (all workspaces)
+        run: npm run typecheck
 
-      - name: Build (client)
-        run: npm run build --workspace app/client
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Judges what the pull request ADDS. The tree already carries advisories;
+      # failing on those would fail every pull request for the same old reason.
+      - uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
 
-      - name: Build (server)
-        run: npm run build --workspace app/server
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The binary, checksum-verified: the marketplace action needs a licence
+      # key for organisations.
+      - name: Install gitleaks
+        env:
+          VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v$VERSION/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "$SHA256  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz -C "$RUNNER_TEMP" gitleaks
+      # Only the commits this change adds. The history holds an old leaked key
+      # that must be revoked at its provider; rescanning it here would make every
+      # run red without making anyone safer.
+      - name: Scan new commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git cat-file -e "$BASE^{commit}" 2>/dev/null; then range="$BASE..HEAD"; else range='-1'; fi
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts="$range" .
 
-      # Production manifest: no host_permissions, no static content_scripts. The
-      # e2e build (localhost pre-granted) is for the harness only and never ships.
-      - name: Build (extension)
-        run: npm run build --workspace app/extension
+  workflow-lint:
+    name: Workflow security lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -sSfL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v$VERSION/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "$SHA256  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.33.1 .github/
+
+  branch-name:
+    name: Branch name rule
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      # Through the environment: a branch name is chosen by whoever opens the
+      # pull request, and must never be pasted into a shell script.
+      - env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          pattern='^(feat|fix|ci|docs|chore|refactor|test|perf|ext|release|hotfix|dependabot)/.+'
+          if ! [[ "$HEAD_REF" =~ $pattern ]]; then
+            echo "::error::Branch '$HEAD_REF' must start with one of: feat/ fix/ ci/ docs/ chore/ refactor/ test/ perf/ ext/ release/ hotfix/"
+            exit 1
+          fi
+
+  # ── tests, database, build ─────────────────────────────────
+  unit:
+    name: Unit tests + coverage
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run db:generate --workspace app/server
+      # All suites are pure functions: no database, no server, no .env. Each
+      # workspace holds its own coverage floor (vitest.config.ts).
+      - run: npm run test:coverage
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: coverage
+          path: |
+            app/*/coverage/lcov.info
+            packages/*/coverage/lcov.info
+          retention-days: 14
+
+  database:
+    name: Migrations, drift, seed
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: apexops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/apexops_ci?schema=public
+      SHADOW_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/apexops_shadow?schema=public
+      NODE_ENV: development
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      - name: Apply migrations to an empty database
+        working-directory: app/server
+        run: npx --no-install prisma migrate deploy
+
+      # A schema edit without its migration would work on the author's machine
+      # and fail on every database that deploys migrations.
+      - name: Migrations match schema.prisma
+        working-directory: app/server
+        run: |
+          PGPASSWORD=postgres createdb -h localhost -U postgres apexops_shadow
+          npx --no-install prisma migrate diff \
+            --from-migrations ../../database/prisma/migrations \
+            --to-schema-datamodel ../../database/prisma/schema.prisma \
+            --shadow-database-url "$SHADOW_DATABASE_URL" \
+            --exit-code
+
+      # Twice: both seeds promise to be safe to re-run.
+      - name: Seed, then seed again
+        run: |
+          for _ in 1 2; do
+            npm run seed:dev --workspace app/server
+            npm run seed:docs --workspace app/server
+          done
+
+  build:
+    name: Build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run db:generate --workspace app/server
+      - run: npm run build
+      # A successful build says nothing about what it asks the browser for.
+      # Production manifest: no host_permissions, no static content_scripts.
+      - name: Check shipped manifest (extension)
+        run: npm run check:manifest --workspace app/extension
+
+  # ── the product running ────────────────────────────────────
+  docker:
+    name: Docker image (${{ matrix.image }})
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: api
+            dockerfile: app/server/Dockerfile
+            target: run
+          - image: migrate
+            dockerfile: app/server/Dockerfile
+            target: migrate
+          - image: web
+            dockerfile: app/client/Dockerfile
+            target: run
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          TARGET: ${{ matrix.target }}
+          IMAGE: apexops-${{ matrix.image }}
+        run: docker build --file "$DOCKERFILE" --target "$TARGET" --tag "$IMAGE:ci" .
+
+  smoke:
+    name: E2E smoke (production stack)
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # Generated per run, used by this stack only, gone with the runner.
+      - name: Throwaway secrets
+        run: |
+          for name in PG_PASSWORD JWT_SECRET JWT_REFRESH_SECRET AI_KEY_SECRET; do
+            echo "$name=$(openssl rand -hex 32)" >> .env
+          done
+      - name: Start the stack
+        run: docker compose up --detach --build client
+      - name: Wait for it
+        run: |
+          for url in http://localhost:3000/api/health http://localhost/apexops.json; do
+            curl --fail --silent --show-error --output /dev/null --retry 60 --retry-delay 2 --retry-all-errors "$url"
+          done
+      - name: Smoke test
+        run: node .github/scripts/smoke.mjs
+      - name: Stack logs
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+  # The extension in a real browser, against the real API and web app: what the
+  # unit suites cannot see (registration, content-script worlds, storage access,
+  # the panel). Run on the oldest Chrome the manifest accepts and on today's.
+  extension-browser:
+    name: Extension in Chrome ${{ matrix.chrome }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # '140' is `minimum_chrome_version` in app/extension/wxt.config.ts.
+        chrome: ['140', 'stable']
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: apexops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/apexops_ci?schema=public
+      NODE_ENV: development
+      JWT_SECRET: ci-only-access-secret-not-used-anywhere-else
+      JWT_REFRESH_SECRET: ci-only-refresh-secret-not-used-anywhere-else
+      # The checks sign in many times from one address.
+      RATE_LIMIT_AUTH_MAX_LOGIN: '200'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      - name: Install Chrome for Testing
+        working-directory: app/server
+        env:
+          CHROME: ${{ matrix.chrome }}
+        run: |
+          installed=$(npx --no-install puppeteer browsers install "chrome@$CHROME" | tail -n 1)
+          echo "$installed"
+          echo "CHROME_PATH=${installed#* }" >> "$GITHUB_ENV"
+
+      # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's sandbox
+      # uses. Allowing them keeps the sandbox on, instead of passing --no-sandbox.
+      - name: Allow Chrome's sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Prepare database
+        run: |
+          npm run db:generate --workspace app/server
+          (cd app/server && npx --no-install prisma migrate deploy)
+          npm run seed:dev --workspace app/server
+
+      - name: Start the API and the web app
+        run: |
+          PORT=3013 WS_PORT=8099 CORS_ORIGIN=http://localhost:5199 \
+            nohup npm run dev --workspace app/server > "$RUNNER_TEMP/api.log" 2>&1 &
+          PORT=5199 VITE_API_URL=http://localhost:3013 VITE_WS_URL=http://localhost:8099 \
+            nohup npm run dev --workspace app/client > "$RUNNER_TEMP/web.log" 2>&1 &
+          for url in http://localhost:3013/api/health http://localhost:5199/apexops.json; do
+            curl --fail --silent --show-error --output /dev/null \
+              --retry 60 --retry-delay 2 --retry-all-errors "$url"
+          done
+
+      - name: Seed the project the checks use
+        run: node .agents/harness/browser-extension/checks/ci-seed.mjs
+
+      # Pre-grants localhost, so a script can bind a site. Never shipped.
+      - name: Build (extension, e2e)
+        run: npm run build:e2e --workspace app/extension
+
+      - name: Capture and delivery (p3)
+        run: xvfb-run --auto-servernum node .agents/harness/browser-extension/checks/p3-extension.mjs
+
+      - name: Connect by project URL (p4)
+        run: xvfb-run --auto-servernum node .agents/harness/browser-extension/checks/p4-extension.mjs
+
+      - name: Toolbar, panel and hardening (p5a)
+        run: xvfb-run --auto-servernum node .agents/harness/browser-extension/checks/p5a-rail.mjs
+
+      - name: Server and web app logs
+        if: failure()
+        run: |
+          echo '--- API'; tail -n 200 "$RUNNER_TEMP/api.log" || true
+          echo '--- web'; tail -n 100 "$RUNNER_TEMP/web.log" || true
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          category: /language:${{ matrix.language }}
+
+  # ── one verdict ────────────────────────────────────────────
+  gate:
+    name: CI gate
+    if: always()
+    needs: [changes, static, dependency-review, secrets, workflow-lint, branch-name, unit, database, build, docker, smoke, extension-browser, codeql]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      # A skipped job is one that had nothing to check. A failed or cancelled one
+      # is never a pass, and neither is `changes` not answering.
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
+          echo "$RESULTS" | jq -e '(.changes.result == "success") and ([.[].result] | all(. == "success" or . == "skipped"))' > /dev/null
