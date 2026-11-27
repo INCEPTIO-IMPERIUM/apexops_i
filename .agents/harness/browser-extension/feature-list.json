@@ -939,7 +939,7 @@
         "Unit: toolbarState.test.ts; mutations (push on any change, unchanged origins told, unbound write, px check off) each red"
       ],
       "passes": true,
-      "notes": "VERIFIED 2026-11-27, Edge 158 only (Chrome for Testing not installed). D1 needed no answer: setAccessLevel works on local, so nothing moved store. NOT measured: whether the access level persists across a browser restart before the worker wakes (a content script running before the worker's first start); the toolbar no longer reads storage either way, so the exposure is only the lock's, not a read."
+      "notes": "VERIFIED 2026-11-27, Edge 158 only (Chrome for Testing not installed). D1 needed no answer: setAccessLevel works on local, so nothing moved store. CORRECTION 2026-11-27: on Chrome for Testing 131 the H2 build was DEAD (first CI Chrome run: p3 registered no scripts). Likely storage.local.setAccessLevel is missing there (reports put it at Chrome 140; inferred, CI on 140 confirms). Fixed: lib/lockStorage.ts never throws, manifest minimum_chrome_version 140, check-manifest enforces it. NOT measured: whether the access level persists across a browser restart before the worker wakes (a content script running before the worker's first start); the toolbar no longer reads storage either way, so the exposure is only the lock's, not a read."
     },
     {
       "id": "P5a-H3",

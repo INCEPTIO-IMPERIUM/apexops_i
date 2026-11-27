@@ -16,6 +16,8 @@ const OPTIONAL_HOSTS = ['http://*/*', 'https://*/*'];
 const same = (a, b) => JSON.stringify([...(a ?? [])].sort()) === JSON.stringify([...b].sort());
 
 if (m.manifest_version !== 3) problems.push(`manifest_version is ${m.manifest_version}, expected 3`);
+// Below this, storage.local cannot be closed to content scripts.
+if (!(Number.parseInt(m.minimum_chrome_version, 10) >= 140)) problems.push(`minimum_chrome_version is ${m.minimum_chrome_version}, expected 140 or later`);
 if (!same(m.permissions, PERMISSIONS)) problems.push(`permissions are ${JSON.stringify(m.permissions)}, expected ${JSON.stringify(PERMISSIONS)}`);
 if (!same(m.optional_host_permissions, OPTIONAL_HOSTS)) problems.push(`optional_host_permissions are ${JSON.stringify(m.optional_host_permissions)}`);
 for (const key of ['host_permissions', 'content_scripts', 'optional_permissions', 'externally_connectable']) {

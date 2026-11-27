@@ -108,7 +108,9 @@ const servers = [
 
 const browser = await puppeteer.launch({
     headless: false,
-    executablePath: EDGE ? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' : undefined,
+    // CHROME_PATH picks a Chrome for Testing other than puppeteer's pinned one, which is older than the
+    // manifest's minimum_chrome_version.
+    executablePath: EDGE ? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' : process.env.CHROME_PATH || undefined,
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, '--window-position=-2400,0'],
 });
 
