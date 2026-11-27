@@ -12,6 +12,7 @@
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { extensionWorker } from './extension-worker.mjs';
 
 const root = new URL('../../../../', import.meta.url);
 const require = createRequire(new URL('app/server/package.json', root));
@@ -134,12 +135,7 @@ const browser = await puppeteer.launch({
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, '--window-position=-2400,0'],
 });
 
-const worker = async () => {
-    const t = await browser.waitForTarget((t) => t.type() === 'service_worker' && t.url().endsWith('/background.js'), {
-        timeout: 15_000,
-    });
-    return t.worker();
-};
+const worker = async () => (await extensionWorker(browser)).worker;
 
 /** Opens a page and records the extension isolated worlds created in it. */
 const open = async (url) => {

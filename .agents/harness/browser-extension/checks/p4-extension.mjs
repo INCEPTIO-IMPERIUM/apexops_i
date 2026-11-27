@@ -14,6 +14,7 @@
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { extensionWorker } from './extension-worker.mjs';
 
 const root = new URL('../../../../', import.meta.url);
 const require = createRequire(new URL('app/server/package.json', root));
@@ -114,8 +115,8 @@ const browser = await puppeteer.launch({
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, '--window-position=-2400,0'],
 });
 
-const swTarget = () => browser.waitForTarget((t) => t.type() === 'service_worker' && t.url().endsWith('/background.js'), { timeout: 15_000 });
-let sw = await (await swTarget()).worker();
+const swTarget = async () => (await extensionWorker(browser)).target;
+let sw = (await extensionWorker(browser)).worker;
 const EXT_ID = new URL((await swTarget()).url()).host;
 const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 
