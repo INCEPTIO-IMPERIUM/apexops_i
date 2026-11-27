@@ -12,6 +12,7 @@ import { sanitizeBatch } from '@/lib/sanitize';
 import { ensureSession } from '@/lib/session';
 import { countEvents, forgetTab } from '@/lib/tabCounts';
 import { TOOLBAR_COMMAND, TOOLBAR_TOGGLE } from '@/lib/toolbarChannel';
+import { forgetToolbarTab, handleToolbarRequest, pushToolbarChanges, type ToolbarRequest } from '@/lib/toolbarState';
 
 /**
  * The service worker: the only part of the extension that talks to ApexOps.
@@ -107,7 +108,27 @@ async function onCommand(command: string): Promise<void> {
     await browser.tabs.sendMessage(tab.id, { type: TOOLBAR_TOGGLE }).catch(() => undefined);
 }
 
+/**
+ * Close `storage.local` to content scripts (hardening H2). It holds the session
+ * tokens and every bound site's ingest key, and by default any content script
+ * — code in a site's renderer — can read it and hear every change to it.
+ * `storage.session` is closed by default; set anyway so the rule is written here.
+ *
+ * Measured on Edge 158: after this, `storage.local.get` from a content script
+ * rejects and `onChanged` delivers nothing there; without it, both leak
+ * (spikes/h2-access-level). Not measured on Chrome.
+ */
+function lockStorage(): void {
+    for (const area of [browser.storage.local, browser.storage.session]) {
+        void area.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }).catch((err: unknown) => console.error('[apexops] could not restrict storage', err));
+    }
+}
+
 export default defineBackground(() => {
+    // First, before any listener can run code that writes a secret.
+    lockStorage();
+    browser.runtime.onInstalled.addListener(lockStorage);
+
     // Before anything can log in or refresh: every session this worker mints or
     // rotates is labelled as the extension's (spec F12).
     setClientLabel(`extension/${browser.runtime.getManifest().version}`);
@@ -125,6 +146,11 @@ export default defineBackground(() => {
             return undefined; // the page side never waits on the worker
         }
 
+        if (where.kind === 'toolbar') {
+            void answer(() => handleToolbarRequest(message as ToolbarRequest, where.origin, where.tabId), sendResponse);
+            return true;
+        }
+
         if (where.kind === 'panel') {
             const tab = sender.tab!;
             void answer(
@@ -139,10 +165,15 @@ export default defineBackground(() => {
     });
 
     browser.commands.onCommand.addListener((command) => void onCommand(command));
-    browser.tabs.onRemoved.addListener((tabId) => void forgetTab(tabId));
+    browser.tabs.onRemoved.addListener((tabId) => {
+        void forgetTab(tabId);
+        void forgetToolbarTab(tabId);
+    });
 
     browser.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && changes[BINDINGS_KEY]) void syncRegistrations();
+        if (area !== 'local') return;
+        if (changes[BINDINGS_KEY]) void syncRegistrations();
+        void pushToolbarChanges(changes);
     });
 
     // A site's access can be revoked from the browser's own extension settings,

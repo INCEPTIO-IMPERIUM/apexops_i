@@ -1,6 +1,6 @@
-import { BINDINGS_KEY, readBindings } from '@/lib/bindings';
-import { HOST_MESSAGE_TAG, isPanelUiMessage, TOOLBAR_TOGGLE } from '@/lib/toolbarChannel';
-import { clampPref, readToolbarPref, TOOLBAR_PREFS_KEY, updateToolbarPref, type ToolbarPref } from '@/lib/toolbarPrefs';
+import { HOST_MESSAGE_TAG, isPanelUiMessage, TOOLBAR_TOGGLE, TOOLBAR_UNBOUND, TOOLBAR_UPDATE } from '@/lib/toolbarChannel';
+import { clampPref, type ToolbarPref } from '@/lib/toolbarPrefs';
+import type { ToolbarRequest, ToolbarStateReply } from '@/lib/toolbarState';
 import { railCss } from '@/lib/toolbarStyles';
 
 /**
@@ -12,6 +12,11 @@ import { railCss } from '@/lib/toolbarStyles';
  * The rail is buttons and a position. The project, the session and the issues
  * are only ever in the panel, an extension-origin `<iframe>` the page cannot
  * read (spec X10, section 10).
+ *
+ * It reads no storage (hardening H2): `storage.local` is closed to content
+ * scripts, because it holds tokens and every site's ingest key. Whether this
+ * site is bound, and where the rail sits, come from the worker, which answers
+ * for this tab's own origin and pushes changes for it alone.
  *
  * It keeps out of the site's way (R20): no listeners on the page while the
  * panel is closed, no keyboard focus until the panel is opened, draggable,
@@ -58,9 +63,20 @@ export default defineContentScript({
     },
 });
 
+const ask = <T>(req: ToolbarRequest): Promise<T> => browser.runtime.sendMessage(req) as Promise<T>;
+/** Fire and forget: a lost position write costs a drag, not data. */
+const savePref = (change: Omit<Extract<ToolbarRequest, { type: 'toolbar-pref' }>, 'type'>) =>
+    void ask({ type: 'toolbar-pref', ...change }).catch(() => undefined);
+
 async function mount(): Promise<void> {
     const origin = location.origin;
-    let pref: ToolbarPref = await readToolbarPref(origin);
+    const initial = await ask<ToolbarStateReply | null>({ type: 'toolbar-state' });
+    // Unbound between the registration and now (a stale tab): do not show up.
+    if (!initial?.bound) {
+        (window as unknown as Record<string, unknown>).__apexopsToolbar = false;
+        return;
+    }
+    let pref: ToolbarPref = initial.pref;
 
     // ── elements ─────────────────────────────────────────────
     const host = document.createElement('apexops-toolbar');
@@ -220,7 +236,7 @@ async function mount(): Promise<void> {
         const moved = drag.moved;
         drag = null;
         rail.classList.remove('dragging');
-        if (moved) void updateToolbarPref(origin, { right: pref.right, bottom: pref.bottom });
+        if (moved) savePref({ right: pref.right, bottom: pref.bottom });
         else if (e.type === 'pointerup') setOpen(!open);
     };
     button.addEventListener('pointerup', endDrag);
@@ -249,7 +265,7 @@ async function mount(): Promise<void> {
         // Chrome 131, so the two never compare equal.)
         if (!frame || e.source !== frame.contentWindow || !isPanelUiMessage(e.data)) return;
         if (e.data.action === 'close') setOpen(false);
-        if (e.data.action === 'hide') void updateToolbarPref(origin, { hidden: true });
+        if (e.data.action === 'hide') savePref({ hidden: true });
     };
     window.addEventListener('message', onMessage);
 
@@ -257,35 +273,31 @@ async function mount(): Promise<void> {
         // From the worker only: no tab means not a content script, and the id
         // means not another extension.
         if (sender.id !== browser.runtime.id || sender.tab) return;
-        if ((message as { type?: unknown } | null)?.type !== TOOLBAR_TOGGLE) return;
-        if (pref.hidden) {
-            void updateToolbarPref(origin, { hidden: false });
-            pref = { ...pref, hidden: false };
-            applyHidden(false);
-            setOpen(true, true);
-        } else {
-            setOpen(!open, true);
+        const m = message as { type?: unknown; origin?: unknown; pref?: ToolbarPref } | null;
+
+        if (m?.type === TOOLBAR_TOGGLE) {
+            if (pref.hidden) {
+                savePref({ hidden: false });
+                pref = { ...pref, hidden: false };
+                applyHidden(false);
+                setOpen(true, true);
+            } else {
+                setOpen(!open, true);
+            }
+            return;
         }
+
+        // Meant for the site this tab was on when the worker last heard from it.
+        if (m?.origin !== origin) return;
+        if (m.type === TOOLBAR_UPDATE && m.pref) {
+            pref = { ...pref, ...m.pref };
+            if (!drag) place(pref);
+            applyHidden(!!pref.hidden);
+        }
+        // Disconnected from the popup: leave now, not at the next reload.
+        if (m.type === TOOLBAR_UNBOUND) teardown();
     };
     browser.runtime.onMessage.addListener(onRuntime);
-
-    const onStorage = (changes: Record<string, Browser.storage.StorageChange>, area: string) => {
-        if (area !== 'local') return;
-        if (changes[TOOLBAR_PREFS_KEY]) {
-            const next = (changes[TOOLBAR_PREFS_KEY].newValue as Record<string, ToolbarPref> | undefined)?.[origin];
-            if (next) {
-                pref = { ...pref, ...next };
-                if (!drag) place(pref);
-                applyHidden(!!pref.hidden);
-            }
-        }
-        if (changes[BINDINGS_KEY]) {
-            const bound = (changes[BINDINGS_KEY].newValue as Record<string, unknown> | undefined)?.[origin];
-            // Disconnected from the popup: leave now, not at the next reload.
-            if (!bound) teardown();
-        }
-    };
-    browser.storage.onChanged.addListener(onStorage);
 
     const onResize = () => place(pref);
     window.addEventListener('resize', onResize);
@@ -295,15 +307,8 @@ async function mount(): Promise<void> {
         window.removeEventListener('message', onMessage);
         window.removeEventListener('resize', onResize);
         browser.runtime.onMessage.removeListener(onRuntime);
-        browser.storage.onChanged.removeListener(onStorage);
         host.remove();
         (window as unknown as Record<string, unknown>).__apexopsToolbar = false;
-    }
-
-    // Unbound between the registration and now (a stale tab): do not show up.
-    if (!(await readBindings())[origin]) {
-        teardown();
-        return;
     }
 
     document.documentElement.append(host);

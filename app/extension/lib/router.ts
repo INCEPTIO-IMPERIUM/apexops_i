@@ -11,6 +11,8 @@ export const PANEL_PATH = '/panel.html';
 
 export const POPUP_TYPES: ReadonlySet<string> = new Set(['status', 'discover', 'connect', 'disconnect', 'logout']);
 export const PANEL_TYPES: ReadonlySet<string> = new Set(['panel-state', 'panel-issues', 'panel-projects', 'panel-switch', 'panel-report', 'panel-signin']);
+/** From the toolbar content script, which runs in the site's renderer (T1): nothing secret either way. */
+export const TOOLBAR_TYPES: ReadonlySet<string> = new Set(['toolbar-state', 'toolbar-pref']);
 
 export interface SenderLike {
     id?: string;
@@ -21,6 +23,7 @@ export interface SenderLike {
 
 export type Route =
     | { kind: 'ingest'; origin: string; tabId: number }
+    | { kind: 'toolbar'; origin: string; tabId: number }
     | { kind: 'popup' }
     | { kind: 'panel'; tabId: number };
 
@@ -57,11 +60,12 @@ export function route(message: unknown, sender: SenderLike, runtimeId: string, e
 
     const path = extensionPagePath(sender, runtimeId, extensionProtocol);
 
-    if (type === 'ingest') {
+    if (type === 'ingest' || TOOLBAR_TYPES.has(type)) {
         // Our own content scripts, in a tab — never an extension page.
         if (path !== null || typeof sender.tab?.id !== 'number') return null;
         // The origin is the browser's record of the sender, never the message's:
-        // a page must not be able to pick which project it writes into.
+        // a page must not be able to pick which project it writes into, nor
+        // whose toolbar settings it reads.
         let origin: string | null = sender.origin ?? null;
         if (!origin && sender.url) {
             try {
@@ -71,7 +75,7 @@ export function route(message: unknown, sender: SenderLike, runtimeId: string, e
             }
         }
         if (!origin || !ORIGIN.test(origin)) return null;
-        return { kind: 'ingest', origin, tabId: sender.tab.id };
+        return { kind: type === 'ingest' ? 'ingest' : 'toolbar', origin, tabId: sender.tab.id };
     }
 
     if (path === POPUP_PATH) return POPUP_TYPES.has(type) ? { kind: 'popup' } : null;
