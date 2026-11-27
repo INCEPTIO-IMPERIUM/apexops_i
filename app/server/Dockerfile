@@ -6,7 +6,7 @@
 # Targets: `run` (default) is the API. `migrate` applies database migrations and
 # exits; it keeps the Prisma CLI, which the API image does not carry.
 
-FROM node:22-bookworm-slim AS base
+FROM node:25-bookworm-slim AS base
 # Prisma picks its engine by the OpenSSL it finds, at generate and at run time.
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
