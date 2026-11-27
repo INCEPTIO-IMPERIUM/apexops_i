@@ -909,6 +909,22 @@
       "notes": "VERIFIED 2026-09-26 by checks/p5a-rail.mjs, 39/39 on Chrome 131 AND Edge 153. Found on the way: an out-of-process iframe keeps its innerWidth while display:none and gets no IntersectionObserver update, so the rail now tells the panel when it is shown or hidden."
     },
     {
+      "id": "P5a-H1",
+      "title": "Worker routing is a tested, default-deny function (hardening H1)",
+      "priority": "high",
+      "depends_on": [
+        "P5a-09"
+      ],
+      "description": "lib/router.ts: route(message, sender) returns ingest | popup | panel | null. Popup requests only from /popup.html (allowlist, was default-allow for any extension page); each sender has an explicit message-type allowlist. Ticket 400 \"Project not found\" maps to no-access; the dead 403 branch is gone.",
+      "steps": [
+        "router.test.ts + panelRequests.test.ts: 125 extension unit tests green",
+        "Mutations each turn a test red: panel gets popup types (5 red), popup default-allow (2 red), ingest from an extension page (1 red, after adding a case that isolates it: the first run SURVIVED because the origin check shadowed the guard), 400 mapping removed (1 red)",
+        "typecheck, shipped build; p3 14/14, p4 34/34, p5a 39/39 on Edge"
+      ],
+      "passes": true,
+      "notes": "VERIFIED 2026-11-01 on branch ext/p5a-h1-router. Chrome for Testing 131 is not installed on this machine now, so the browser checks ran on Edge only. Deviations from the plan: no 'toolbar' route class yet (nothing sends it; H2 adds it with its sender); ingest from a tab with no id is now refused (it was counted under tab -1). Server 400 confirmed in api/tickets.ts (non-member -> 'Project not found' with 400)."
+    },
+    {
       "id": "P5b",
       "title": "Vendored VisBug tools + Report bug with element",
       "priority": "high",

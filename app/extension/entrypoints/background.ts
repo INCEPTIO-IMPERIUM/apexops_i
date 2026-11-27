@@ -5,6 +5,7 @@ import { clearIngestProblem, recordIngestProblem } from '@/lib/ingestProblems';
 import { createIngestQueue, type QueueItem, type SendResult } from '@/lib/ingestQueue';
 import type { PanelRequest, Request } from '@/lib/messages';
 import { handlePanelRequest } from '@/lib/panelRequests';
+import { route } from '@/lib/router';
 import { syncRegistrations } from '@/lib/registration';
 import { handleRequest } from '@/lib/requests';
 import { sanitizeBatch } from '@/lib/sanitize';
@@ -25,33 +26,6 @@ const QUEUE_KEY = 'ingestQueue';
 const RETRY_ALARM = 'ingest-retry';
 
 const extensionOrigin = () => new URL(browser.runtime.getURL('/')).origin;
-
-/**
- * The path of the extension page that sent this, or null if it is not one of
- * ours (popup, panel).
- *
- * Decided by the sender's URL, not by `sender.tab`: an extension page opened in
- * a tab has one, and a content script running in a web page has one too. A
- * content script's `sender.url` is the web page's, which is what tells them
- * apart — a web page's URL is http(s), never our scheme.
- *
- * The scheme rather than our exact origin because the toolbar panel is loaded
- * through `use_dynamic_url`, whose host is a per-session random id, not the
- * extension id. `sender.id` is what says the page is this extension's.
- */
-const extensionPagePath = (sender: Browser.runtime.MessageSender): string | null => {
-    if (sender.id !== browser.runtime.id || typeof sender.url !== 'string') return null;
-    try {
-        const url = new URL(sender.url);
-        return url.protocol === new URL(extensionOrigin()).protocol ? url.pathname : null;
-    } catch {
-        return null;
-    }
-};
-
-const isExtensionPage = (sender: Browser.runtime.MessageSender): boolean => extensionPagePath(sender) !== null;
-
-const PANEL_PATH = '/panel.html';
 
 const queue = createIngestQueue(
     {
@@ -104,19 +78,12 @@ async function deliver(item: QueueItem): Promise<SendResult> {
     return 'drop';
 }
 
-async function onIngest(body: unknown, sender: Browser.runtime.MessageSender): Promise<void> {
-    // Only our own content scripts, running in a tab — and not an extension
-    // page, which is what the popup is and has no business sending events.
-    if (sender.id !== browser.runtime.id || !sender.tab || isExtensionPage(sender)) return;
-    // The origin comes from the browser's record of the sender, never from the
-    // message: a page must not be able to pick which project it writes into.
-    const origin = sender.origin ?? (sender.url ? new URL(sender.url).origin : null);
-    if (!origin) return;
+async function onIngest(body: unknown, origin: string, tabId: number): Promise<void> {
     if (!(await readBindings())[origin]) return;
 
     const events = sanitizeBatch(body);
     await queue.enqueue(origin, events);
-    await countEvents(sender.tab.id ?? -1, events.length);
+    await countEvents(tabId, events.length);
     await queue.flush();
 }
 
@@ -146,34 +113,27 @@ export default defineBackground(() => {
     setClientLabel(`extension/${browser.runtime.getManifest().version}`);
 
     browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        const msg = message as { type?: unknown; body?: unknown } | null;
+        // Who may send what is `route`'s call, and it denies by default: the
+        // panel lives on a site someone else controls, so it cannot ask for what
+        // the popup can (spec R18).
+        const where = route(message, sender, browser.runtime.id, new URL(extensionOrigin()).protocol);
+        if (!where) return undefined;
+        const version = browser.runtime.getManifest().version;
 
-        if (msg?.type === 'ingest') {
-            void onIngest(msg.body, sender);
+        if (where.kind === 'ingest') {
+            void onIngest((message as { body?: unknown }).body, where.origin, where.tabId);
             return undefined; // the page side never waits on the worker
         }
 
-        // Everything else is a request from one of our own pages, and each page
-        // gets its own set: the panel lives on a site someone else controls,
-        // so it cannot ask for what the popup can (spec R18).
-        const path = extensionPagePath(sender);
-        if (path === null) return undefined;
-        const version = browser.runtime.getManifest().version;
-        const isPanelRequest = typeof msg?.type === 'string' && msg.type.startsWith('panel-');
-
-        if (path === PANEL_PATH) {
-            // Always inside a tab; which one — and so which site — is the
-            // browser's answer, not the message's.
-            if (!isPanelRequest || typeof sender.tab?.id !== 'number') return undefined;
-            const tab = sender.tab;
+        if (where.kind === 'panel') {
+            const tab = sender.tab!;
             void answer(
-                () => handlePanelRequest(message as PanelRequest, { version, tabId: tab.id!, tabUrl: tab.url ?? null, tabTitle: tab.title ?? '' }),
+                () => handlePanelRequest(message as PanelRequest, { version, tabId: where.tabId, tabUrl: tab.url ?? null, tabTitle: tab.title ?? '' }),
                 sendResponse
             );
             return true;
         }
 
-        if (isPanelRequest) return undefined;
         void answer(() => handleRequest(message as Request, { version, extensionOrigin: extensionOrigin() }), sendResponse);
         return true; // keep the channel open for the async reply
     });
