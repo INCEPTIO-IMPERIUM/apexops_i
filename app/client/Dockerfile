@@ -2,7 +2,7 @@
 # workspace, so the only lockfile is the root one, and the web app compiles
 # @apexops/shared from source.
 
-FROM node:22-bookworm-slim AS build
+FROM node:25-bookworm-slim AS build
 WORKDIR /repo
 # Every workspace manifest: `npm ci` checks the lockfile against all of them.
 COPY package.json package-lock.json ./
