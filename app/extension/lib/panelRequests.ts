@@ -5,6 +5,7 @@ import { ConnectProblem, connectSite } from './connect';
 import { readIngestProblems } from './ingestProblems';
 import type { PanelIssue, PanelProject, PanelRequest, PanelState, Reply, ReportResult } from './messages';
 import { fail, toReply } from './requests';
+import { TICKET_PRIORITIES } from '@apexops/shared/types/tickets';
 import { stripUrl } from './sanitize';
 import { ensureSession, login, storedApiUrl, whoami } from './session';
 import { eventsFromTab } from './tabCounts';
@@ -39,7 +40,7 @@ const siteOf = (ctx: PanelContext): string | null => {
 
 const appLink = (b: Binding, path: string): string | null => (b.appOrigin ? `${b.appOrigin}/p/${encodeURIComponent(b.slug)}${path}` : null);
 
-const LEVELS = new Set(['low', 'medium', 'high', 'critical']);
+const LEVELS: ReadonlySet<string> = new Set(TICKET_PRIORITIES);
 const MAX_TITLE = 200;
 const MAX_DESCRIPTION = 20_000;
 

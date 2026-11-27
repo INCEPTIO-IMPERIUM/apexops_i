@@ -157,6 +157,9 @@ async function mount(): Promise<void> {
             loaded = true;
             tellFrame(pendingFocus);
         });
+        // Only once there is a panel to hear from: a toolbar that is never
+        // opened adds no `message` listener to the page (R20).
+        window.addEventListener('message', onMessage);
         root.append(frame);
         return frame;
     }
@@ -174,7 +177,8 @@ async function mount(): Promise<void> {
     }
 
     const onPageKey = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') setOpen(false);
+        // Something earlier already handled this Escape: let it have it.
+        if (e.key === 'Escape' && !e.defaultPrevented) setOpen(false);
     };
 
     function setOpen(next: boolean, focusPanel = false): void {
@@ -267,8 +271,6 @@ async function mount(): Promise<void> {
         if (e.data.action === 'close') setOpen(false);
         if (e.data.action === 'hide') savePref({ hidden: true });
     };
-    window.addEventListener('message', onMessage);
-
     const onRuntime = (message: unknown, sender: Browser.runtime.MessageSender) => {
         // From the worker only: no tab means not a content script, and the id
         // means not another extension.
