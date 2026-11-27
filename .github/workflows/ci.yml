@@ -74,3 +74,98 @@ jobs:
       # e2e build (localhost pre-granted) is for the harness only and never ships.
       - name: Build (extension)
         run: npm run build --workspace app/extension
+
+      # A successful build says nothing about what it asks the browser for.
+      - name: Check shipped manifest (extension)
+        run: npm run check:manifest --workspace app/extension
+
+  # The extension in a real browser, against the real API and web app: what the
+  # unit suites cannot see (registration, content-script worlds, storage access,
+  # the panel). Separate from `check` because it needs a database and a display,
+  # and a failure here should not hide a type error there.
+  #
+  # Still no secrets: the database lives only for this job, and every value below
+  # is a throwaway written in plain sight.
+  extension-browser:
+    name: extension in Chrome
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: apexops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/apexops_ci?schema=public
+      NODE_ENV: development
+      JWT_SECRET: ci-only-access-secret-not-used-anywhere-else
+      JWT_REFRESH_SECRET: ci-only-refresh-secret-not-used-anywhere-else
+      # The checks sign in many times from one address.
+      RATE_LIMIT_AUTH_MAX_LOGIN: '200'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Puppeteer lives in the server workspace and pins the Chrome it drives.
+      - name: Install Chrome for Testing
+        run: npx puppeteer browsers install chrome
+        working-directory: app/server
+
+      # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's sandbox
+      # uses. Allowing them keeps the sandbox on, instead of passing --no-sandbox.
+      - name: Allow Chrome's sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Prepare database
+        run: |
+          npm run db:generate --workspace app/server
+          (cd app/server && npx prisma db push --skip-generate)
+          npm run seed:dev --workspace app/server
+
+      - name: Start the API and the web app
+        run: |
+          PORT=3013 WS_PORT=8099 CORS_ORIGIN=http://localhost:5199             nohup npm run dev --workspace app/server > "$RUNNER_TEMP/api.log" 2>&1 &
+          PORT=5199 VITE_API_URL=http://localhost:3013 VITE_WS_URL=http://localhost:8099             nohup npm run dev --workspace app/client > "$RUNNER_TEMP/web.log" 2>&1 &
+          for url in http://localhost:3013/api/health http://localhost:5199/apexops.json; do
+            curl --fail --silent --show-error --output /dev/null               --retry 60 --retry-delay 2 --retry-all-errors "$url"
+          done
+
+      - name: Seed the project the checks use
+        run: node .agents/harness/browser-extension/checks/ci-seed.mjs
+
+      # Pre-grants localhost, so a script can bind a site. Never shipped.
+      - name: Build (extension, e2e)
+        run: npm run build:e2e --workspace app/extension
+
+      - name: Capture and delivery (p3)
+        run: xvfb-run --auto-servernum node .agents/harness/browser-extension/checks/p3-extension.mjs
+
+      - name: Connect by project URL (p4)
+        run: xvfb-run --auto-servernum node .agents/harness/browser-extension/checks/p4-extension.mjs
+
+      - name: Toolbar, panel and hardening (p5a)
+        run: xvfb-run --auto-servernum node .agents/harness/browser-extension/checks/p5a-rail.mjs
+
+      - name: Server and web app logs
+        if: failure()
+        run: |
+          echo '--- API'; tail -n 200 "$RUNNER_TEMP/api.log" || true
+          echo '--- web'; tail -n 100 "$RUNNER_TEMP/web.log" || true
